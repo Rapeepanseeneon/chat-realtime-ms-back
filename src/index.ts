@@ -1,6 +1,13 @@
 import { Hono } from "hono";
 import { upgradeWebSocket, websocket } from "hono/bun";
+import { cors } from "hono/cors";
 import type { WSContext } from "hono/ws";
+import {
+  createMessage,
+  getRecentMessages,
+  initializeDatabase,
+  type StoredMessage,
+} from "./database";
 
 const MAX_NAME_LENGTH = 50;
 const MAX_MESSAGE_LENGTH = 1_000;
@@ -16,11 +23,7 @@ type ClientMessage = {
 type ServerMessage =
   | {
       type: "message.new";
-      data: {
-        name: string;
-        text: string;
-        createdAt: string;
-      };
+      data: StoredMessage;
     }
   | {
       type: "error";
@@ -95,6 +98,15 @@ const broadcast = (message: ServerMessage) => {
   }
 };
 
+await initializeDatabase();
+
+app.use(
+  "/api/*",
+  cors({
+    allowMethods: ["GET"],
+  }),
+);
+
 app.get("/", (context) =>
   context.json({
     service: "chat-realtime-ms-back",
@@ -109,6 +121,16 @@ app.get("/health", (context) =>
   }),
 );
 
+app.get("/api/messages", async (context) => {
+  try {
+    const messages = await getRecentMessages();
+    return context.json({ messages });
+  } catch (error) {
+    console.error("Failed to load message history", error);
+    return context.json({ error: "Failed to load message history" }, 500);
+  }
+});
+
 app.get(
   "/ws",
   upgradeWebSocket(() => ({
@@ -116,7 +138,7 @@ app.get(
       clients.set(getClientKey(client), client);
       console.info(`WebSocket connected (${clients.size} total)`);
     },
-    onMessage(event, client) {
+    async onMessage(event, client) {
       const message = parseClientMessage(event.data);
 
       if (!message) {
@@ -129,13 +151,25 @@ app.get(
         return;
       }
 
-      broadcast({
-        type: "message.new",
-        data: {
-          ...message.data,
-          createdAt: new Date().toISOString(),
-        },
-      });
+      try {
+        const storedMessage = await createMessage(
+          message.data.name,
+          message.data.text,
+        );
+
+        broadcast({
+          type: "message.new",
+          data: storedMessage,
+        });
+      } catch (error) {
+        console.error("Failed to save message", error);
+        sendJson(client, {
+          type: "error",
+          data: {
+            message: "Message could not be saved. Please try again.",
+          },
+        });
+      }
     },
     onClose(_event, client) {
       clients.delete(getClientKey(client));
