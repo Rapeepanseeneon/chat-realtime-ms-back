@@ -4,19 +4,23 @@ import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { WSContext } from "hono/ws";
 import {
-  createMessage,
+  createPrivateMessage,
   createSession,
   createUser,
   deleteSession,
   findConflictingUser,
+  findChatUserById,
   findUserByEmail,
   findUserBySession,
+  getOtherUsers,
+  getPrivateMessages,
   getRecentMessages,
   initializeDatabase,
   toPublicUser,
   updateUser,
+  type ChatUser,
+  type PrivateMessage,
   type PublicUser,
-  type StoredMessage,
 } from "./database";
 
 const MAX_MESSAGE_LENGTH = 1_000;
@@ -33,13 +37,18 @@ const secureCookies =
   (Bun.env.COOKIE_SECURE !== "false" && Bun.env.NODE_ENV === "production");
 
 type Variables = { user: PublicUser };
-type ClientMessage = { type: "message.send"; data: { text: string } };
+type ClientMessage = {
+  type: "message.send";
+  receiverId: string;
+  message: string;
+};
 type ServerMessage =
-  | { type: "message.new"; data: StoredMessage }
+  | { type: "message.new"; message: PrivateMessage }
   | { type: "error"; data: { message: string } };
 
 const app = new Hono<{ Variables: Variables }>();
-const clients = new Map<unknown, { client: WSContext; user: PublicUser }>();
+const connectionsByUser = new Map<string, Set<WSContext>>();
+const authenticatedClients = new Map<unknown, PublicUser>();
 const getClientKey = (client: WSContext): unknown => client.raw ?? client;
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
@@ -118,13 +127,15 @@ const parseClientMessage = (rawValue: unknown): ClientMessage | null => {
     if (
       !isRecord(value) ||
       value.type !== "message.send" ||
-      !isRecord(value.data)
+      typeof value.receiverId !== "string" ||
+      typeof value.message !== "string"
     )
       return null;
-    if (typeof value.data.text !== "string") return null;
-    const text = value.data.text.trim();
-    if (!text || text.length > MAX_MESSAGE_LENGTH) return null;
-    return { type: "message.send", data: { text } };
+    const receiverId = value.receiverId.trim();
+    const message = value.message.trim();
+    if (!/^\d+$/.test(receiverId)) return null;
+    if (!message || message.length > MAX_MESSAGE_LENGTH) return null;
+    return { type: "message.send", receiverId, message };
   } catch {
     return null;
   }
@@ -134,12 +145,31 @@ const sendJson = (client: WSContext, message: ServerMessage) => {
   try {
     client.send(JSON.stringify(message));
   } catch {
-    clients.delete(getClientKey(client));
+    removeConnection(client);
   }
 };
 
-const broadcast = (message: ServerMessage) => {
-  for (const { client } of clients.values()) sendJson(client, message);
+const addConnection = (user: PublicUser, client: WSContext) => {
+  const connections = connectionsByUser.get(user.id) ?? new Set<WSContext>();
+  connections.add(client);
+  connectionsByUser.set(user.id, connections);
+  authenticatedClients.set(getClientKey(client), user);
+};
+
+const removeConnection = (client: WSContext) => {
+  const key = getClientKey(client);
+  const user = authenticatedClients.get(key);
+  authenticatedClients.delete(key);
+  if (!user) return;
+  const connections = connectionsByUser.get(user.id);
+  connections?.delete(client);
+  if (connections?.size === 0) connectionsByUser.delete(user.id);
+};
+
+const sendToUser = (userId: string, message: ServerMessage) => {
+  for (const client of connectionsByUser.get(userId) ?? []) {
+    sendJson(client, message);
+  }
 };
 
 await initializeDatabase();
@@ -159,7 +189,7 @@ app.get("/", (context) =>
   context.json({ service: "chat-realtime-ms-back", websocket: "/ws" }),
 );
 app.get("/health", (context) =>
-  context.json({ status: "ok", connectedClients: clients.size }),
+  context.json({ status: "ok", connectedClients: authenticatedClients.size }),
 );
 
 app.post("/api/auth/register", async (context) => {
@@ -323,6 +353,38 @@ app.put("/api/profile", requireAuth, async (context) => {
   }
 });
 
+app.get("/api/users", requireAuth, async (context) => {
+  try {
+    const users = await getOtherUsers(context.get("user").id);
+    return context.json({ users });
+  } catch (error) {
+    console.error("Failed to load users", error);
+    return context.json({ error: "Users could not be loaded." }, 500);
+  }
+});
+
+app.get("/api/messages/:userId", requireAuth, async (context) => {
+  const currentUser = context.get("user");
+  const otherUserId = context.req.param("userId");
+  if (
+    !otherUserId ||
+    !/^\d+$/.test(otherUserId) ||
+    otherUserId === currentUser.id
+  ) {
+    return context.json({ error: "Please select a valid user." }, 400);
+  }
+
+  try {
+    const otherUser = await findChatUserById(otherUserId);
+    if (!otherUser) return context.json({ error: "User was not found." }, 404);
+    const messages = await getPrivateMessages(currentUser.id, otherUserId);
+    return context.json({ messages });
+  } catch (error) {
+    console.error("Failed to load private message history", error);
+    return context.json({ error: "Message history could not be loaded." }, 500);
+  }
+});
+
 app.get("/api/messages", requireAuth, async (context) => {
   try {
     return context.json({ messages: await getRecentMessages() });
@@ -339,8 +401,10 @@ app.get(
     const user = context.get("user");
     return {
       onOpen(_event, client) {
-        clients.set(getClientKey(client), { client, user });
-        console.info(`WebSocket connected (${clients.size} total)`);
+        addConnection(user, client);
+        console.info(
+          `WebSocket connected for user ${user.id} (${authenticatedClients.size} total)`,
+        );
       },
       async onMessage(event, client) {
         const message = parseClientMessage(event.data);
@@ -353,22 +417,43 @@ app.get(
           });
           return;
         }
-        const authenticatedClient = clients.get(getClientKey(client));
-        if (!authenticatedClient) {
+        const sender = authenticatedClients.get(getClientKey(client));
+        if (!sender) {
           sendJson(client, {
             type: "error",
             data: { message: "Your session is not authenticated." },
           });
           return;
         }
+        if (message.receiverId === sender.id) {
+          sendJson(client, {
+            type: "error",
+            data: { message: "You cannot send a message to yourself." },
+          });
+          return;
+        }
         try {
-          const storedMessage = await createMessage(
-            authenticatedClient.user.username,
-            message.data.text,
+          const receiver = await findChatUserById(message.receiverId);
+          if (!receiver) {
+            sendJson(client, {
+              type: "error",
+              data: { message: "The selected user was not found." },
+            });
+            return;
+          }
+          const storedMessage = await createPrivateMessage(
+            { id: sender.id, username: sender.username } satisfies ChatUser,
+            receiver.id,
+            message.message,
           );
-          broadcast({ type: "message.new", data: storedMessage });
+          const serverMessage: ServerMessage = {
+            type: "message.new",
+            message: storedMessage,
+          };
+          sendToUser(sender.id, serverMessage);
+          sendToUser(receiver.id, serverMessage);
         } catch (error) {
-          console.error("Failed to save message", error);
+          console.error("Failed to save private message", error);
           sendJson(client, {
             type: "error",
             data: { message: "Message could not be saved. Please try again." },
@@ -376,12 +461,14 @@ app.get(
         }
       },
       onClose(_event, client) {
-        clients.delete(getClientKey(client));
-        console.info(`WebSocket disconnected (${clients.size} total)`);
+        removeConnection(client);
+        console.info(
+          `WebSocket disconnected (${authenticatedClients.size} total)`,
+        );
       },
       onError(_event, client) {
-        clients.delete(getClientKey(client));
-        console.error(`WebSocket error (${clients.size} total)`);
+        removeConnection(client);
+        console.error(`WebSocket error (${authenticatedClients.size} total)`);
       },
     };
   }),

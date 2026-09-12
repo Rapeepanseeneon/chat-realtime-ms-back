@@ -7,6 +7,19 @@ export type StoredMessage = {
   createdAt: string;
 };
 
+export type ChatUser = {
+  id: string;
+  username: string;
+};
+
+export type PrivateMessage = {
+  id: string;
+  senderId: string;
+  receiverId: string;
+  messageText: string;
+  createdAt: string;
+};
+
 export type User = {
   id: string;
   username: string;
@@ -22,6 +35,14 @@ type MessageRow = {
   id: string;
   name: string;
   text: string;
+  createdAt: Date | string;
+};
+
+type PrivateMessageRow = {
+  id: string;
+  senderId: string;
+  receiverId: string;
+  messageText: string;
   createdAt: Date | string;
 };
 
@@ -46,6 +67,14 @@ const normalizeMessage = (row: MessageRow): StoredMessage => ({
   id: row.id,
   name: row.name,
   text: row.text,
+  createdAt: toIsoString(row.createdAt),
+});
+
+const normalizePrivateMessage = (row: PrivateMessageRow): PrivateMessage => ({
+  id: row.id,
+  senderId: row.senderId,
+  receiverId: row.receiverId,
+  messageText: row.messageText,
   createdAt: toIsoString(row.createdAt),
 });
 
@@ -99,7 +128,20 @@ export const initializeDatabase = async () => {
       CONSTRAINT messages_message_text_not_blank CHECK (char_length(btrim(message_text)) BETWEEN 1 AND 1000)
     )
   `;
+  await database`
+    ALTER TABLE messages
+    ADD COLUMN IF NOT EXISTS sender_id BIGINT REFERENCES users(id) ON DELETE CASCADE
+  `;
+  await database`
+    ALTER TABLE messages
+    ADD COLUMN IF NOT EXISTS receiver_id BIGINT REFERENCES users(id) ON DELETE CASCADE
+  `;
   await database`CREATE INDEX IF NOT EXISTS messages_created_at_id_idx ON messages (created_at DESC, id DESC)`;
+  await database`
+    CREATE INDEX IF NOT EXISTS messages_private_conversation_idx
+    ON messages (sender_id, receiver_id, created_at DESC, id DESC)
+    WHERE sender_id IS NOT NULL AND receiver_id IS NOT NULL
+  `;
 };
 
 export const createUser = async (
@@ -122,6 +164,29 @@ export const findUserByEmail = async (email: string): Promise<User | null> => {
     FROM users WHERE lower(email) = lower(${email}) LIMIT 1
   `;
   return user ? normalizeUser(user) : null;
+};
+
+export const getOtherUsers = async (
+  currentUserId: string,
+): Promise<ChatUser[]> => {
+  return database<ChatUser[]>`
+    SELECT id::text AS id, username
+    FROM users
+    WHERE id <> ${currentUserId}
+    ORDER BY lower(username) ASC, id ASC
+  `;
+};
+
+export const findChatUserById = async (
+  userId: string,
+): Promise<ChatUser | null> => {
+  const [user] = await database<ChatUser[]>`
+    SELECT id::text AS id, username
+    FROM users
+    WHERE id = ${userId}
+    LIMIT 1
+  `;
+  return user ?? null;
 };
 
 export const findConflictingUser = async (
@@ -202,11 +267,58 @@ export const createMessage = async (
   return normalizeMessage(message);
 };
 
+export const createPrivateMessage = async (
+  sender: ChatUser,
+  receiverId: string,
+  messageText: string,
+): Promise<PrivateMessage> => {
+  const [message] = await database<PrivateMessageRow[]>`
+    INSERT INTO messages (sender_name, sender_id, receiver_id, message_text)
+    VALUES (${sender.username}, ${sender.id}, ${receiverId}, ${messageText})
+    RETURNING
+      id::text AS id,
+      sender_id::text AS "senderId",
+      receiver_id::text AS "receiverId",
+      message_text AS "messageText",
+      created_at AS "createdAt"
+  `;
+  if (!message)
+    throw new Error("PostgreSQL did not return the inserted private message");
+  return normalizePrivateMessage(message);
+};
+
+export const getPrivateMessages = async (
+  currentUserId: string,
+  otherUserId: string,
+): Promise<PrivateMessage[]> => {
+  const messages = await database<PrivateMessageRow[]>`
+    SELECT id, "senderId", "receiverId", "messageText", "createdAt"
+    FROM (
+      SELECT
+        id::text AS id,
+        sender_id::text AS "senderId",
+        receiver_id::text AS "receiverId",
+        message_text AS "messageText",
+        created_at AS "createdAt"
+      FROM messages
+      WHERE
+        (sender_id = ${currentUserId} AND receiver_id = ${otherUserId})
+        OR (sender_id = ${otherUserId} AND receiver_id = ${currentUserId})
+      ORDER BY created_at DESC, id DESC
+      LIMIT 50
+    ) AS recent_private_messages
+    ORDER BY "createdAt" ASC, id::bigint ASC
+  `;
+  return messages.map(normalizePrivateMessage);
+};
+
 export const getRecentMessages = async (): Promise<StoredMessage[]> => {
   const messages = await database<MessageRow[]>`
     SELECT id, name, text, "createdAt" FROM (
       SELECT id::text AS id, sender_name AS name, message_text AS text, created_at AS "createdAt"
-      FROM messages ORDER BY created_at DESC, id DESC LIMIT 50
+      FROM messages
+      WHERE sender_id IS NULL AND receiver_id IS NULL
+      ORDER BY created_at DESC, id DESC LIMIT 50
     ) AS recent_messages
     ORDER BY "createdAt" ASC, id::bigint ASC
   `;
