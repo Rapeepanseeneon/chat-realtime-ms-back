@@ -4,6 +4,8 @@ import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { WSContext } from "hono/ws";
 import {
+  areFriends,
+  createFriendRequest,
   createMessage,
   createPrivateMessage,
   createSession,
@@ -13,10 +15,14 @@ import {
   findChatUserById,
   findUserByEmail,
   findUserBySession,
-  getOtherUsers,
+  getFriends,
+  getFriendshipStatus,
   getPrivateMessages,
+  getReceivedFriendRequests,
   getRecentMessages,
   initializeDatabase,
+  respondToFriendRequest,
+  searchUsers,
   toPublicUser,
   updateUser,
   type ChatUser,
@@ -368,11 +374,131 @@ app.put("/api/profile", requireAuth, async (context) => {
 
 app.get("/api/users", requireAuth, async (context) => {
   try {
-    const users = await getOtherUsers(context.get("user").id);
+    const users = await getFriends(context.get("user").id);
     return context.json({ users });
   } catch (error) {
-    console.error("Failed to load users", error);
-    return context.json({ error: "Users could not be loaded." }, 500);
+    console.error("Failed to load friends", error);
+    return context.json({ error: "Friends could not be loaded." }, 500);
+  }
+});
+
+app.get("/api/friends", requireAuth, async (context) => {
+  try {
+    return context.json({ friends: await getFriends(context.get("user").id) });
+  } catch (error) {
+    console.error("Failed to load friends", error);
+    return context.json({ error: "Friends could not be loaded." }, 500);
+  }
+});
+
+app.get("/api/friends/search", requireAuth, async (context) => {
+  const query = (context.req.query("q") ?? "").trim();
+  if (!query || query.length > 254) {
+    return context.json({ error: "Enter a username or email to search." }, 400);
+  }
+  try {
+    return context.json({
+      users: await searchUsers(context.get("user").id, query),
+    });
+  } catch (error) {
+    console.error("Failed to search users", error);
+    return context.json({ error: "User search could not be completed." }, 500);
+  }
+});
+
+app.get("/api/friend-requests", requireAuth, async (context) => {
+  try {
+    return context.json({
+      requests: await getReceivedFriendRequests(context.get("user").id),
+    });
+  } catch (error) {
+    console.error("Failed to load friend requests", error);
+    return context.json({ error: "Friend requests could not be loaded." }, 500);
+  }
+});
+
+app.post("/api/friend-requests", requireAuth, async (context) => {
+  const value = await readJson(context);
+  const receiverId =
+    typeof value?.receiverId === "string" ? value.receiverId.trim() : "";
+  const sender = context.get("user");
+  if (!/^\d+$/.test(receiverId)) {
+    return context.json({ error: "Please select a valid user." }, 400);
+  }
+  if (receiverId === sender.id) {
+    return context.json({ error: "You cannot add yourself as a friend." }, 400);
+  }
+  try {
+    if (!(await findChatUserById(receiverId))) {
+      return context.json({ error: "User was not found." }, 404);
+    }
+    const result = await createFriendRequest(sender.id, receiverId);
+    if (result.outcome === "friends") {
+      return context.json({ error: "You are already friends." }, 409);
+    }
+    if (result.outcome === "pending") {
+      return context.json(
+        { error: "A friend request is already pending." },
+        409,
+      );
+    }
+    return context.json(
+      { requestId: result.requestId, message: "Friend request sent." },
+      201,
+    );
+  } catch (error) {
+    console.error("Failed to create friend request", error);
+    const status = await getFriendshipStatus(sender.id, receiverId).catch(
+      () => null,
+    );
+    if (status === "accepted") {
+      return context.json({ error: "You are already friends." }, 409);
+    }
+    if (status === "pending") {
+      return context.json(
+        { error: "A friend request is already pending." },
+        409,
+      );
+    }
+    return context.json({ error: "Friend request could not be sent." }, 500);
+  }
+});
+
+app.put("/api/friend-requests/:requestId", requireAuth, async (context) => {
+  const requestId = context.req.param("requestId") ?? "";
+  const value = await readJson(context);
+  const action = value?.action;
+  if (
+    !/^\d+$/.test(requestId) ||
+    (action !== "accept" && action !== "reject")
+  ) {
+    return context.json(
+      { error: "Please provide a valid request action." },
+      400,
+    );
+  }
+  const updatedStatus = action === "accept" ? "accepted" : "rejected";
+  try {
+    const updated = await respondToFriendRequest(
+      requestId,
+      context.get("user").id,
+      updatedStatus,
+    );
+    if (!updated) {
+      return context.json(
+        { error: "Pending friend request was not found." },
+        404,
+      );
+    }
+    return context.json({
+      message:
+        updatedStatus === "accepted"
+          ? "Friend request accepted."
+          : "Friend request rejected.",
+    });
+  } catch (error) {
+    console.error("Failed to respond to friend request", error);
+    return context.json({ error: "Friend request could not be updated." }, 500);
   }
 });
 
@@ -390,6 +516,12 @@ app.get("/api/messages/:userId", requireAuth, async (context) => {
   try {
     const otherUser = await findChatUserById(otherUserId);
     if (!otherUser) return context.json({ error: "User was not found." }, 404);
+    if (!(await areFriends(currentUser.id, otherUserId))) {
+      return context.json(
+        { error: "You can only view messages with accepted friends." },
+        403,
+      );
+    }
     const messages = await getPrivateMessages(currentUser.id, otherUserId);
     return context.json({ messages });
   } catch (error) {
@@ -469,6 +601,13 @@ app.get(
             sendJson(client, {
               type: "error",
               data: { message: "The selected user was not found." },
+            });
+            return;
+          }
+          if (!(await areFriends(sender.id, receiver.id))) {
+            sendJson(client, {
+              type: "error",
+              data: { message: "You can only message accepted friends." },
             });
             return;
           }

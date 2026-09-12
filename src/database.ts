@@ -12,6 +12,21 @@ export type ChatUser = {
   username: string;
 };
 
+export type FriendSearchResult = ChatUser & {
+  relationship: "none" | "outgoing_pending" | "incoming_pending" | "friends";
+};
+
+export type FriendRequest = {
+  id: string;
+  sender: ChatUser;
+  createdAt: string;
+};
+
+export type CreateFriendRequestResult =
+  | { outcome: "created"; requestId: string }
+  | { outcome: "pending" }
+  | { outcome: "friends" };
+
 export type PrivateMessage = {
   id: string;
   senderId: string;
@@ -53,6 +68,13 @@ type UserRow = {
   passwordHash: string;
   createdAt: Date | string;
   updatedAt: Date | string;
+};
+
+type FriendRequestRow = {
+  id: string;
+  senderId: string;
+  senderUsername: string;
+  createdAt: Date | string;
 };
 
 const databaseUrl = Bun.env.DATABASE_URL?.trim();
@@ -119,6 +141,26 @@ export const initializeDatabase = async () => {
   await database`CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_unique_idx ON users (lower(username))`;
   await database`CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique_idx ON users (lower(email))`;
   await database`
+    CREATE TABLE IF NOT EXISTS friend_requests (
+      id BIGSERIAL PRIMARY KEY,
+      sender_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      receiver_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status VARCHAR(10) NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT friend_requests_not_self CHECK (sender_id <> receiver_id),
+      CONSTRAINT friend_requests_status_valid CHECK (status IN ('pending', 'accepted', 'rejected'))
+    )
+  `;
+  await database`
+    CREATE UNIQUE INDEX IF NOT EXISTS friend_requests_user_pair_unique_idx
+    ON friend_requests (LEAST(sender_id, receiver_id), GREATEST(sender_id, receiver_id))
+  `;
+  await database`
+    CREATE INDEX IF NOT EXISTS friend_requests_receiver_status_idx
+    ON friend_requests (receiver_id, status, created_at DESC)
+  `;
+  await database`
     CREATE TABLE IF NOT EXISTS sessions (
       id BIGSERIAL PRIMARY KEY,
       user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -177,15 +219,148 @@ export const findUserByEmail = async (email: string): Promise<User | null> => {
   return user ? normalizeUser(user) : null;
 };
 
-export const getOtherUsers = async (
+export const getFriends = async (
   currentUserId: string,
 ): Promise<ChatUser[]> => {
   return database<ChatUser[]>`
-    SELECT id::text AS id, username
-    FROM users
-    WHERE id <> ${currentUserId}
-    ORDER BY lower(username) ASC, id ASC
+    SELECT users.id::text AS id, users.username
+    FROM friend_requests
+    JOIN users ON users.id = CASE
+      WHEN friend_requests.sender_id = ${currentUserId}
+        THEN friend_requests.receiver_id
+      ELSE friend_requests.sender_id
+    END
+    WHERE friend_requests.status = 'accepted'
+      AND (${currentUserId} = friend_requests.sender_id OR ${currentUserId} = friend_requests.receiver_id)
+    ORDER BY lower(users.username) ASC, users.id ASC
   `;
+};
+
+export const searchUsers = async (
+  currentUserId: string,
+  query: string,
+): Promise<FriendSearchResult[]> => {
+  return database<FriendSearchResult[]>`
+    SELECT
+      users.id::text AS id,
+      users.username,
+      CASE
+        WHEN friend_requests.status = 'accepted' THEN 'friends'
+        WHEN friend_requests.status = 'pending'
+          AND friend_requests.sender_id = ${currentUserId} THEN 'outgoing_pending'
+        WHEN friend_requests.status = 'pending' THEN 'incoming_pending'
+        ELSE 'none'
+      END AS relationship
+    FROM users
+    LEFT JOIN friend_requests ON
+      LEAST(friend_requests.sender_id, friend_requests.receiver_id) = LEAST(users.id, ${currentUserId})
+      AND GREATEST(friend_requests.sender_id, friend_requests.receiver_id) = GREATEST(users.id, ${currentUserId})
+    WHERE users.id <> ${currentUserId}
+      AND (
+        lower(users.username) LIKE '%' || lower(${query}) || '%'
+        OR lower(users.email) = lower(${query})
+      )
+    ORDER BY
+      CASE
+        WHEN lower(users.username) = lower(${query}) OR lower(users.email) = lower(${query}) THEN 0
+        ELSE 1
+      END,
+      lower(users.username) ASC
+    LIMIT 10
+  `;
+};
+
+export const getReceivedFriendRequests = async (
+  currentUserId: string,
+): Promise<FriendRequest[]> => {
+  const rows = await database<FriendRequestRow[]>`
+    SELECT
+      friend_requests.id::text AS id,
+      users.id::text AS "senderId",
+      users.username AS "senderUsername",
+      friend_requests.created_at AS "createdAt"
+    FROM friend_requests
+    JOIN users ON users.id = friend_requests.sender_id
+    WHERE friend_requests.receiver_id = ${currentUserId}
+      AND friend_requests.status = 'pending'
+    ORDER BY friend_requests.created_at DESC, friend_requests.id DESC
+  `;
+  return rows.map((row) => ({
+    id: row.id,
+    sender: { id: row.senderId, username: row.senderUsername },
+    createdAt: toIsoString(row.createdAt),
+  }));
+};
+
+export const getFriendshipStatus = async (
+  firstUserId: string,
+  secondUserId: string,
+): Promise<"pending" | "accepted" | "rejected" | null> => {
+  const [row] = await database<
+    { status: "pending" | "accepted" | "rejected" }[]
+  >`
+    SELECT status
+    FROM friend_requests
+    WHERE LEAST(sender_id, receiver_id) = LEAST(${firstUserId}::bigint, ${secondUserId}::bigint)
+      AND GREATEST(sender_id, receiver_id) = GREATEST(${firstUserId}::bigint, ${secondUserId}::bigint)
+    LIMIT 1
+  `;
+  return row?.status ?? null;
+};
+
+export const areFriends = async (
+  firstUserId: string,
+  secondUserId: string,
+): Promise<boolean> =>
+  (await getFriendshipStatus(firstUserId, secondUserId)) === "accepted";
+
+export const createFriendRequest = async (
+  senderId: string,
+  receiverId: string,
+): Promise<CreateFriendRequestResult> => {
+  const [existing] = await database<{ id: string; status: string }[]>`
+    SELECT id::text AS id, status
+    FROM friend_requests
+    WHERE LEAST(sender_id, receiver_id) = LEAST(${senderId}::bigint, ${receiverId}::bigint)
+      AND GREATEST(sender_id, receiver_id) = GREATEST(${senderId}::bigint, ${receiverId}::bigint)
+    LIMIT 1
+  `;
+  if (existing?.status === "accepted") return { outcome: "friends" };
+  if (existing?.status === "pending") return { outcome: "pending" };
+  if (existing) {
+    const [request] = await database<{ id: string }[]>`
+      UPDATE friend_requests
+      SET sender_id = ${senderId}, receiver_id = ${receiverId}, status = 'pending',
+        created_at = NOW(), updated_at = NOW()
+      WHERE id = ${existing.id}
+      RETURNING id::text AS id
+    `;
+    if (!request) throw new Error("Friend request could not be renewed");
+    return { outcome: "created", requestId: request.id };
+  }
+  const [request] = await database<{ id: string }[]>`
+    INSERT INTO friend_requests (sender_id, receiver_id)
+    VALUES (${senderId}, ${receiverId})
+    RETURNING id::text AS id
+  `;
+  if (!request) throw new Error("Friend request could not be created");
+  return { outcome: "created", requestId: request.id };
+};
+
+export const respondToFriendRequest = async (
+  requestId: string,
+  receiverId: string,
+  status: "accepted" | "rejected",
+): Promise<boolean> => {
+  const rows = await database<{ id: string }[]>`
+    UPDATE friend_requests
+    SET status = ${status}, updated_at = NOW()
+    WHERE id::text = ${requestId}
+      AND receiver_id = ${receiverId}
+      AND status = 'pending'
+    RETURNING id::text AS id
+  `;
+  return rows.length === 1;
 };
 
 export const findChatUserById = async (
