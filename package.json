@@ -1,0 +1,23 @@
+{
+  "name": "chat-realtime-ms-back",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "bun@1.4.2",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --hot src/index.ts",
+    "start": "bun run src/index.ts",
+    "build": "bun build ./src/index.ts --target=bun --outdir=dist",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "hono": "4.13.7"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "prettier": "3.9.6",
+    "typescript": "7.0.2"
+  }
+}
