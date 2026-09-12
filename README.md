@@ -12,13 +12,14 @@ bun install
 bun run dev
 ```
 
-The HTTP server runs at `http://localhost:3001` by default. The WebSocket endpoint
-is `ws://localhost:3001/ws`, and message history is available from
-`GET http://localhost:3001/api/messages`. Set `PORT` in the uncommitted `.env`
-file to use another port.
+The HTTP server runs at `http://localhost:3001` by default. The authenticated
+WebSocket endpoint is `ws://localhost:3001/ws`, and message history is available
+from `GET http://localhost:3001/api/messages`. Set `FRONTEND_URL` to the exact
+frontend origin. In production, use HTTPS and set `COOKIE_SECURE=true`.
 
 On startup, the backend uses `DATABASE_URL` to connect to PostgreSQL and creates
-the `messages` table and its history index if they do not already exist.
+the `users`, `sessions`, and `messages` tables and their indexes if needed.
+Passwords are hashed with Argon2id and session cookies are HttpOnly.
 
 ## Checks
 
