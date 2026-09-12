@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { WSContext } from "hono/ws";
 import {
+  createMessage,
   createPrivateMessage,
   createSession,
   createUser,
@@ -21,6 +22,7 @@ import {
   type ChatUser,
   type PrivateMessage,
   type PublicUser,
+  type StoredMessage,
 } from "./database";
 
 const MAX_MESSAGE_LENGTH = 1_000;
@@ -37,13 +39,12 @@ const secureCookies =
   (Bun.env.COOKIE_SECURE !== "false" && Bun.env.NODE_ENV === "production");
 
 type Variables = { user: PublicUser };
-type ClientMessage = {
-  type: "message.send";
-  receiverId: string;
-  message: string;
-};
+type ClientMessage =
+  | { type: "message.send"; receiverId: string; message: string }
+  | { type: "message.send.global"; message: string };
 type ServerMessage =
   | { type: "message.new"; message: PrivateMessage }
+  | { type: "message.new"; data: StoredMessage }
   | { type: "error"; data: { message: string } };
 
 const app = new Hono<{ Variables: Variables }>();
@@ -124,13 +125,21 @@ const parseClientMessage = (rawValue: unknown): ClientMessage | null => {
   if (typeof rawValue !== "string") return null;
   try {
     const value: unknown = JSON.parse(rawValue);
+    if (!isRecord(value) || value.type !== "message.send") return null;
+
+    if (isRecord(value.data) && typeof value.data.text === "string") {
+      const legacyMessage = value.data.text.trim();
+      if (!legacyMessage || legacyMessage.length > MAX_MESSAGE_LENGTH)
+        return null;
+      return { type: "message.send.global", message: legacyMessage };
+    }
+
     if (
-      !isRecord(value) ||
-      value.type !== "message.send" ||
       typeof value.receiverId !== "string" ||
       typeof value.message !== "string"
-    )
+    ) {
       return null;
+    }
     const receiverId = value.receiverId.trim();
     const message = value.message.trim();
     if (!/^\d+$/.test(receiverId)) return null;
@@ -170,6 +179,10 @@ const sendToUser = (userId: string, message: ServerMessage) => {
   for (const client of connectionsByUser.get(userId) ?? []) {
     sendJson(client, message);
   }
+};
+
+const sendToAllUsers = (message: ServerMessage) => {
+  for (const userId of connectionsByUser.keys()) sendToUser(userId, message);
 };
 
 await initializeDatabase();
@@ -423,6 +436,24 @@ app.get(
             type: "error",
             data: { message: "Your session is not authenticated." },
           });
+          return;
+        }
+        if (message.type === "message.send.global") {
+          try {
+            const storedMessage = await createMessage(
+              sender.username,
+              message.message,
+            );
+            sendToAllUsers({ type: "message.new", data: storedMessage });
+          } catch (error) {
+            console.error("Failed to save legacy global message", error);
+            sendJson(client, {
+              type: "error",
+              data: {
+                message: "Message could not be saved. Please try again.",
+              },
+            });
+          }
           return;
         }
         if (message.receiverId === sender.id) {

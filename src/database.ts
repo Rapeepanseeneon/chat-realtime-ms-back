@@ -59,7 +59,18 @@ const databaseUrl = Bun.env.DATABASE_URL?.trim();
 
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
 
-const database = new SQL(databaseUrl);
+const databasePoolSize = Number(Bun.env.DATABASE_POOL_SIZE ?? 5);
+if (!Number.isInteger(databasePoolSize) || databasePoolSize < 1) {
+  throw new Error("DATABASE_POOL_SIZE must be a positive integer");
+}
+
+const databaseGlobal = globalThis as typeof globalThis & {
+  pbMessengerDatabase?: SQL;
+};
+const database =
+  databaseGlobal.pbMessengerDatabase ??
+  new SQL(databaseUrl, { max: databasePoolSize });
+databaseGlobal.pbMessengerDatabase = database;
 const toIsoString = (value: Date | string) =>
   value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 
@@ -183,7 +194,7 @@ export const findChatUserById = async (
   const [user] = await database<ChatUser[]>`
     SELECT id::text AS id, username
     FROM users
-    WHERE id = ${userId}
+    WHERE id::text = ${userId}
     LIMIT 1
   `;
   return user ?? null;
