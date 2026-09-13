@@ -34,6 +34,11 @@ export type PrivateMessage = {
   messageText: string;
   createdAt: string;
   readAt: string | null;
+  messageStatus: "ghost" | "scheduled" | "sent" | "cancelled";
+  scheduledAt: string | null;
+  releasedAt: string | null;
+  stateUpdatedAt: string | null;
+  deliveryId: string | null;
   editedAt: string | null;
   deletedAt: string | null;
   replyToMessageId: string | null;
@@ -73,6 +78,11 @@ type PrivateMessageRow = {
   messageText: string;
   createdAt: Date | string;
   readAt: Date | string | null;
+  messageStatus: PrivateMessage["messageStatus"];
+  scheduledAt: Date | string | null;
+  releasedAt: Date | string | null;
+  stateUpdatedAt: Date | string | null;
+  deliveryId: string | null;
   editedAt: Date | string | null;
   deletedAt: Date | string | null;
   replyToMessageId: string | null;
@@ -131,6 +141,11 @@ const normalizePrivateMessage = (row: PrivateMessageRow): PrivateMessage => ({
   messageText: row.messageText,
   createdAt: toIsoString(row.createdAt),
   readAt: row.readAt ? toIsoString(row.readAt) : null,
+  messageStatus: row.messageStatus,
+  scheduledAt: row.scheduledAt ? toIsoString(row.scheduledAt) : null,
+  releasedAt: row.releasedAt ? toIsoString(row.releasedAt) : null,
+  stateUpdatedAt: row.stateUpdatedAt ? toIsoString(row.stateUpdatedAt) : null,
+  deliveryId: row.deliveryId,
   editedAt: row.editedAt ? toIsoString(row.editedAt) : null,
   deletedAt: row.deletedAt ? toIsoString(row.deletedAt) : null,
   replyToMessageId: row.replyToMessageId,
@@ -230,6 +245,20 @@ export const initializeDatabase = async () => {
   await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ`;
   await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`;
   await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT REFERENCES messages(id) ON DELETE SET NULL`;
+  await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_status VARCHAR(10) NOT NULL DEFAULT 'sent'`;
+  await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ`;
+  await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ`;
+  await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS state_updated_at TIMESTAMPTZ`;
+  await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_id BIGINT`;
+  await database.begin(async (transaction) => {
+    await transaction`ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_status_valid`;
+    await transaction`ALTER TABLE messages ADD CONSTRAINT messages_status_valid CHECK (
+      message_status IN ('ghost', 'scheduled', 'sent', 'cancelled')
+      AND (message_status = 'sent' OR (sender_id IS NOT NULL AND receiver_id IS NOT NULL AND sender_id <> receiver_id AND read_at IS NULL AND released_at IS NULL))
+      AND (message_status <> 'scheduled' OR scheduled_at IS NOT NULL)
+    )`;
+  });
+  await database`CREATE INDEX IF NOT EXISTS messages_due_ghost_idx ON messages (scheduled_at, id) WHERE message_status = 'scheduled' AND deleted_at IS NULL`;
   // Preserve the legacy nonblank rule; only tombstones may have erased content.
   await database.begin(async (transaction) => {
     await transaction`ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_message_text_not_blank`;
@@ -509,12 +538,14 @@ export const createPrivateMessage = async (
   receiverId: string,
   messageText: string,
   replyToMessageId: string | null = null,
+  ghost = false,
 ): Promise<PrivateMessage> => {
   const [message] = await database<{ id: string }[]>`
-    INSERT INTO messages (sender_name, sender_id, receiver_id, message_text, reply_to_message_id)
-    SELECT ${sender.username}, ${sender.id}, ${receiverId}, ${messageText}, ${replyToMessageId}::bigint
+    INSERT INTO messages (sender_name, sender_id, receiver_id, message_text, reply_to_message_id, message_status, state_updated_at)
+    SELECT ${sender.username}, ${sender.id}, ${receiverId}, ${messageText}, ${replyToMessageId}::bigint, ${ghost ? "ghost" : "sent"}, clock_timestamp()
     WHERE ${replyToMessageId}::bigint IS NULL OR EXISTS (
       SELECT 1 FROM messages original WHERE original.id = ${replyToMessageId}::bigint
+        AND original.message_status = 'sent'
         AND ((original.sender_id = ${sender.id} AND original.receiver_id = ${receiverId})
           OR (original.sender_id = ${receiverId} AND original.receiver_id = ${sender.id}))
     )
@@ -530,13 +561,18 @@ export const createPrivateMessage = async (
 // Join the current original, rather than persisting a stale copy of reply content.
 const selectPrivateMessages = async (
   ids: string[],
+  viewerId: string | null = null,
+  pool = database,
 ): Promise<PrivateMessage[]> => {
   if (!ids.length) return [];
-  const rows = await database<PrivateMessageRow[]>`
+  const rows = await pool<PrivateMessageRow[]>`
     SELECT m.id::text AS id, m.sender_id::text AS "senderId",
       m.receiver_id::text AS "receiverId",
       CASE WHEN m.deleted_at IS NULL THEN m.message_text ELSE '' END AS "messageText",
-      m.created_at AS "createdAt", m.read_at AS "readAt",
+      COALESCE(m.released_at, m.created_at) AS "createdAt", m.read_at AS "readAt",
+      m.message_status AS "messageStatus", m.scheduled_at AS "scheduledAt",
+      m.released_at AS "releasedAt", m.state_updated_at AS "stateUpdatedAt",
+      CASE WHEN m.message_status = 'sent' THEN COALESCE(m.delivery_id, m.id)::text ELSE NULL END AS "deliveryId",
       m.edited_at AS "editedAt", m.deleted_at AS "deletedAt",
       m.reply_to_message_id::text AS "replyToMessageId",
       original.sender_id::text AS "replySenderId",
@@ -544,10 +580,12 @@ const selectPrivateMessages = async (
       original.edited_at AS "replyEditedAt", original.deleted_at AS "replyDeletedAt"
     FROM messages m
     LEFT JOIN messages original ON original.id = m.reply_to_message_id
+      AND original.message_status = 'sent'
       AND ((original.sender_id = m.sender_id AND original.receiver_id = m.receiver_id)
         OR (original.sender_id = m.receiver_id AND original.receiver_id = m.sender_id))
     WHERE m.id IN ${database(ids)} AND m.receiver_id IS NOT NULL AND m.sender_id IS NOT NULL
-    ORDER BY m.created_at ASC, m.id ASC
+      AND (${viewerId}::bigint IS NULL OR m.message_status = 'sent' OR m.sender_id = ${viewerId}::bigint)
+    ORDER BY COALESCE(m.released_at, m.created_at) ASC, m.id ASC
   `;
   return rows.map(normalizePrivateMessage);
 };
@@ -556,6 +594,87 @@ export const findPrivateMessage = async (
   messageId: string,
 ): Promise<PrivateMessage | null> =>
   (await selectPrivateMessages([messageId]))[0] ?? null;
+
+export type GhostAction =
+  | { action: "edit"; text: string }
+  | { action: "delete" }
+  | { action: "schedule"; scheduledAt: string | null };
+
+export const updateGhost = async (
+  messageId: string,
+  ownerId: string,
+  command: GhostAction,
+): Promise<PrivateMessage | null> => {
+  const rows =
+    command.action === "edit"
+      ? await database<{ id: string }[]>`
+      UPDATE messages SET message_text = ${command.text}, edited_at = clock_timestamp(), state_updated_at = clock_timestamp()
+      WHERE id = ${messageId} AND sender_id = ${ownerId}
+        AND message_status IN ('ghost', 'scheduled') AND deleted_at IS NULL
+      RETURNING id::text AS id
+    `
+      : command.action === "delete"
+        ? await database<{ id: string }[]>`
+        UPDATE messages SET message_text = '', deleted_at = clock_timestamp(), message_status = 'cancelled',
+          scheduled_at = NULL, state_updated_at = clock_timestamp()
+        WHERE id = ${messageId} AND sender_id = ${ownerId}
+          AND message_status IN ('ghost', 'scheduled') AND deleted_at IS NULL
+        RETURNING id::text AS id
+      `
+        : await database<{ id: string }[]>`
+        UPDATE messages SET scheduled_at = ${command.scheduledAt}::timestamptz,
+          message_status = CASE WHEN ${command.scheduledAt}::timestamptz IS NULL THEN 'ghost' ELSE 'scheduled' END,
+          state_updated_at = clock_timestamp()
+        WHERE id = ${messageId} AND sender_id = ${ownerId}
+          AND message_status IN ('ghost', 'scheduled') AND deleted_at IS NULL
+          AND (${command.scheduledAt}::timestamptz IS NULL OR ${command.scheduledAt}::timestamptz > clock_timestamp())
+        RETURNING id::text AS id
+      `;
+  return rows[0] ? findPrivateMessage(rows[0].id) : null;
+};
+
+// Compare-and-set is the only transition that makes a ghost visible. The same
+// PostgreSQL sequence orders normal sends and releases for unread/read boundaries.
+export const releaseGhost = async (
+  messageId: string,
+  ownerId: string,
+): Promise<PrivateMessage | null> => {
+  const [released] = await database<{ id: string }[]>`
+    UPDATE messages m SET message_status = 'sent', released_at = clock_timestamp(),
+      delivery_id = nextval(pg_get_serial_sequence('messages', 'id')),
+      state_updated_at = clock_timestamp(), scheduled_at = NULL, read_at = NULL
+    WHERE m.id = ${messageId} AND m.sender_id = ${ownerId}
+      AND m.message_status IN ('ghost', 'scheduled') AND m.deleted_at IS NULL
+      AND EXISTS (SELECT 1 FROM friend_requests f WHERE f.status = 'accepted'
+        AND LEAST(f.sender_id, f.receiver_id) = LEAST(m.sender_id, m.receiver_id)
+        AND GREATEST(f.sender_id, f.receiver_id) = GREATEST(m.sender_id, m.receiver_id))
+    RETURNING m.id::text AS id
+  `;
+  return released ? findPrivateMessage(released.id) : null;
+};
+
+export const releaseDueGhosts = async (): Promise<PrivateMessage[]> => {
+  const ids = await database.begin(async (transaction) => {
+    const released = await transaction<{ id: string }[]>`
+      WITH due AS (
+        SELECT m.id FROM messages m
+        WHERE m.message_status = 'scheduled' AND m.scheduled_at <= clock_timestamp()
+          AND m.deleted_at IS NULL
+          AND EXISTS (SELECT 1 FROM friend_requests f WHERE f.status = 'accepted'
+            AND LEAST(f.sender_id, f.receiver_id) = LEAST(m.sender_id, m.receiver_id)
+            AND GREATEST(f.sender_id, f.receiver_id) = GREATEST(m.sender_id, m.receiver_id))
+        ORDER BY m.scheduled_at, m.id LIMIT 50 FOR UPDATE OF m SKIP LOCKED
+      )
+      UPDATE messages m SET message_status = 'sent', released_at = clock_timestamp(),
+        delivery_id = nextval(pg_get_serial_sequence('messages', 'id')),
+        state_updated_at = clock_timestamp(), scheduled_at = NULL, read_at = NULL
+      FROM due WHERE m.id = due.id
+      RETURNING m.id::text AS id
+    `;
+    return released.map((row) => row.id);
+  });
+  return selectPrivateMessages(ids);
+};
 
 export const mutatePrivateMessage = async (
   messageId: string,
@@ -570,12 +689,14 @@ export const mutatePrivateMessage = async (
         UPDATE messages SET message_text = ${text}, edited_at = clock_timestamp()
         WHERE id = ${messageId} AND sender_id = ${ownerId}
           AND receiver_id IS NOT NULL AND deleted_at IS NULL
+          AND message_status = 'sent'
         RETURNING id::text AS id
       `
       : await database<{ id: string }[]>`
         UPDATE messages SET message_text = '', deleted_at = clock_timestamp()
         WHERE id = ${messageId} AND sender_id = ${ownerId}
           AND receiver_id IS NOT NULL AND deleted_at IS NULL
+          AND message_status = 'sent'
         RETURNING id::text AS id
       `;
   return rows[0] ? findPrivateMessage(rows[0].id) : null;
@@ -589,12 +710,16 @@ export const getPrivateMessages = async (
       SELECT id::text AS id
       FROM messages
       WHERE
-        (sender_id = ${currentUserId} AND receiver_id = ${otherUserId})
-        OR (sender_id = ${otherUserId} AND receiver_id = ${currentUserId})
-      ORDER BY created_at DESC, id DESC
+        ((sender_id = ${currentUserId} AND receiver_id = ${otherUserId})
+        OR (sender_id = ${otherUserId} AND receiver_id = ${currentUserId}))
+        AND (message_status = 'sent' OR (sender_id = ${currentUserId} AND message_status IN ('ghost', 'scheduled')))
+      ORDER BY COALESCE(released_at, created_at) DESC, id DESC
       LIMIT 50
   `;
-  return selectPrivateMessages(messages.map((message) => message.id));
+  return selectPrivateMessages(
+    messages.map((message) => message.id),
+    currentUserId,
+  );
 };
 
 export const getUnreadCounts = async (
@@ -613,6 +738,7 @@ export const getUnreadCounts = async (
     AND messages.sender_id <> ${receiverId}
     AND messages.read_at IS NULL
     AND messages.deleted_at IS NULL
+    AND messages.message_status = 'sent'
   GROUP BY messages.sender_id
 `;
 
@@ -622,23 +748,28 @@ export const markMessagesRead = async (
   receiverId: string,
   senderId: string,
   throughMessageId: string,
-): Promise<{ readAt: string | null } | null> => {
-  const [boundary] = await database<{ id: string }[]>`
-    SELECT id::text AS id FROM messages
+): Promise<{ readAt: string | null; throughDeliveryId: string } | null> => {
+  const [boundary] = await database<{ id: string; deliveryId: string }[]>`
+    SELECT id::text AS id, COALESCE(delivery_id, id)::text AS "deliveryId" FROM messages
     WHERE id::text = ${throughMessageId}
       AND receiver_id = ${receiverId} AND sender_id = ${senderId}
+      AND message_status = 'sent'
   `;
   if (!boundary) return null;
   const [result] = await database<{ readAt: Date | string | null }[]>`
     WITH updated AS (
       UPDATE messages SET read_at = NOW()
       WHERE receiver_id = ${receiverId} AND sender_id = ${senderId}
-        AND id <= ${boundary.id} AND read_at IS NULL
+        AND COALESCE(delivery_id, id) <= ${boundary.deliveryId}::bigint AND read_at IS NULL
+        AND message_status = 'sent'
       RETURNING read_at
     )
     SELECT max(read_at) AS "readAt" FROM updated
   `;
-  return { readAt: result?.readAt ? toIsoString(result.readAt) : null };
+  return {
+    readAt: result?.readAt ? toIsoString(result.readAt) : null,
+    throughDeliveryId: boundary.deliveryId,
+  };
 };
 
 export const getRecentMessages = async (): Promise<StoredMessage[]> => {

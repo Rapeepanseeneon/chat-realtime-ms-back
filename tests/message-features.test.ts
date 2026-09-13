@@ -332,7 +332,7 @@ const origin = Bun.env.FRONTEND_URL ?? "http://localhost:3000";
       for (const client of clients) client.socket.close();
       await Bun.sleep(100);
       for (const user of users)
-        await database`DELETE FROM users WHERE email = ${user.email}`;
+        await database`DELETE FROM users WHERE lower(email) = lower(${user.email})`;
       await database.close();
     }
   },

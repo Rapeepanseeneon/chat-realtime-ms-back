@@ -36,6 +36,7 @@ export type StatusServerEvent =
       readerId: string;
       senderId: string;
       throughMessageId: string;
+      throughDeliveryId: string;
       readAt: string;
     }
   | { type: "error"; data: { message: string } };
@@ -247,6 +248,7 @@ export class ChatStatusTracker {
           readerId: user.id,
           senderId: friendId,
           throughMessageId: event.throughMessageId,
+          throughDeliveryId: result.throughDeliveryId,
           readAt: result.readAt,
         };
         this.transport.sendToUser(friendId, receipt);

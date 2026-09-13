@@ -10,6 +10,8 @@ import {
   createPrivateMessage,
   findPrivateMessage,
   mutatePrivateMessage,
+  updateGhost,
+  releaseGhost,
   createSession,
   createUser,
   deleteSession,
@@ -38,6 +40,7 @@ import {
   type StatusClientEvent,
   type StatusServerEvent,
 } from "./chat-status";
+import { startGhostScheduler } from "./ghost-scheduler";
 
 const MAX_MESSAGE_LENGTH = 1_000;
 const MIN_PASSWORD_LENGTH = 8;
@@ -55,18 +58,23 @@ const secureCookies =
 type Variables = { user: PublicUser };
 type ClientMessage =
   | {
-      type: "message.send";
+      type: "message.send" | "ghost.create";
       receiverId: string;
       message: string;
       replyToMessageId: string | null;
     }
   | { type: "message.edit"; messageId: string; message: string }
   | { type: "message.delete"; messageId: string }
+  | { type: "ghost.edit"; messageId: string; message: string }
+  | { type: "ghost.delete"; messageId: string }
+  | { type: "ghost.release"; messageId: string }
+  | { type: "ghost.schedule"; messageId: string; scheduledAt: string | null }
   | { type: "message.send.global"; message: string }
   | StatusClientEvent;
 type ServerMessage =
   | { type: "message.new"; message: PrivateMessage }
   | { type: "message.edited" | "message.deleted"; message: PrivateMessage }
+  | { type: "ghost.updated"; message: PrivateMessage }
   | { type: "message.new"; data: StoredMessage }
   | StatusServerEvent;
 
@@ -155,18 +163,44 @@ const parseClientMessage = (rawValue: unknown): ClientMessage | null => {
       /^[1-9]\d{0,18}$/.test(id) &&
       BigInt(id) <= 9_223_372_036_854_775_807n;
     if (value.type === "chat.sync") return { type: "chat.sync" };
-    if (value.type === "message.delete") {
-      return isId(value.messageId)
-        ? { type: "message.delete", messageId: value.messageId }
+    if (value.type === "ghost.schedule") {
+      if (!isId(value.messageId)) return null;
+      if (value.scheduledAt === null)
+        return {
+          type: "ghost.schedule",
+          messageId: value.messageId,
+          scheduledAt: null,
+        };
+      if (
+        typeof value.scheduledAt !== "string" ||
+        !/(Z|[+-]\d{2}:\d{2})$/.test(value.scheduledAt)
+      )
+        return null;
+      const time = Date.parse(value.scheduledAt);
+      return Number.isFinite(time) && time > Date.now()
+        ? {
+            type: "ghost.schedule",
+            messageId: value.messageId,
+            scheduledAt: new Date(time).toISOString(),
+          }
         : null;
     }
-    if (value.type === "message.edit") {
+    if (
+      value.type === "message.delete" ||
+      value.type === "ghost.delete" ||
+      value.type === "ghost.release"
+    ) {
+      return isId(value.messageId)
+        ? { type: value.type, messageId: value.messageId }
+        : null;
+    }
+    if (value.type === "message.edit" || value.type === "ghost.edit") {
       const message =
         typeof value.message === "string" ? value.message.trim() : "";
       return isId(value.messageId) &&
         message.length > 0 &&
         message.length <= MAX_MESSAGE_LENGTH
-        ? { type: "message.edit", messageId: value.messageId, message }
+        ? { type: value.type, messageId: value.messageId, message }
         : null;
     }
     if (value.type === "message.read") {
@@ -183,9 +217,14 @@ const parseClientMessage = (rawValue: unknown): ClientMessage | null => {
         ? { type: value.type, receiverId: value.receiverId }
         : null;
     }
-    if (value.type !== "message.send") return null;
+    if (value.type !== "message.send" && value.type !== "ghost.create")
+      return null;
 
-    if (isRecord(value.data) && typeof value.data.text === "string") {
+    if (
+      value.type === "message.send" &&
+      isRecord(value.data) &&
+      typeof value.data.text === "string"
+    ) {
       const legacyMessage = value.data.text.trim();
       if (!legacyMessage || legacyMessage.length > MAX_MESSAGE_LENGTH)
         return null;
@@ -205,7 +244,7 @@ const parseClientMessage = (rawValue: unknown): ClientMessage | null => {
     if (value.replyToMessageId != null && !isId(value.replyToMessageId))
       return null;
     return {
-      type: "message.send",
+      type: value.type,
       receiverId,
       message,
       replyToMessageId:
@@ -269,6 +308,15 @@ const chatStatus = new ChatStatusTracker({
 });
 
 await initializeDatabase();
+const publishReleasedGhost = async (message: PrivateMessage) => {
+  sendToUser(message.senderId, { type: "message.new", message });
+  sendToUser(message.receiverId, { type: "message.new", message });
+  await chatStatus
+    .publishUnread(message.receiverId)
+    .catch((error) =>
+      console.error("Failed to publish released ghost unread count", error),
+    );
+};
 
 app.use(
   "/api/*",
@@ -593,6 +641,24 @@ app.put("/api/friend-requests/:requestId", requireAuth, async (context) => {
   }
 });
 
+// Never return even a ghost's existence to the receiver or another user.
+app.get("/api/ghosts/:messageId", requireAuth, async (context) => {
+  const id = context.req.param("messageId") ?? "";
+  if (!/^[1-9]\d{0,18}$/.test(id))
+    return context.json({ error: "Ghost not found." }, 404);
+  const message = await findPrivateMessage(id);
+  const user = context.get("user");
+  if (
+    !message ||
+    message.senderId !== user.id ||
+    message.messageStatus === "sent" ||
+    message.messageStatus === "cancelled" ||
+    !(await areFriends(user.id, message.receiverId))
+  )
+    return context.json({ error: "Ghost not found." }, 404);
+  return context.json({ message });
+});
+
 app.get("/api/messages/:userId", requireAuth, async (context) => {
   const currentUser = context.get("user");
   const otherUserId = context.req.param("userId");
@@ -713,6 +779,69 @@ app.get(
               return;
             }
             if (
+              message.type === "ghost.edit" ||
+              message.type === "ghost.delete" ||
+              message.type === "ghost.schedule" ||
+              message.type === "ghost.release"
+            ) {
+              const original = await findPrivateMessage(message.messageId);
+              if (
+                !original ||
+                original.senderId !== sender.id ||
+                original.deletedAt ||
+                !["ghost", "scheduled"].includes(original.messageStatus) ||
+                !(await areFriends(sender.id, original.receiverId))
+              ) {
+                sendJson(client, {
+                  type: "error",
+                  data: {
+                    message:
+                      "Ghost is not available or you do not have permission.",
+                  },
+                });
+                return;
+              }
+              if (message.type === "ghost.release") {
+                const released = await releaseGhost(original.id, sender.id);
+                if (released) await publishReleasedGhost(released);
+                else
+                  sendJson(client, {
+                    type: "error",
+                    data: {
+                      message:
+                        "Ghost has already changed or cannot be released.",
+                    },
+                  });
+              } else {
+                const updated = await updateGhost(
+                  original.id,
+                  sender.id,
+                  message.type === "ghost.edit"
+                    ? { action: "edit", text: message.message }
+                    : message.type === "ghost.delete"
+                      ? { action: "delete" }
+                      : {
+                          action: "schedule",
+                          scheduledAt: message.scheduledAt,
+                        },
+                );
+                if (updated)
+                  sendToUser(sender.id, {
+                    type: "ghost.updated",
+                    message: updated,
+                  });
+                else
+                  sendJson(client, {
+                    type: "error",
+                    data: {
+                      message:
+                        "Ghost has already changed. Schedule must be in the future.",
+                    },
+                  });
+              }
+              return;
+            }
+            if (
               message.type === "message.edit" ||
               message.type === "message.delete"
             ) {
@@ -721,6 +850,7 @@ app.get(
                 if (
                   !original ||
                   original.senderId !== sender.id ||
+                  original.messageStatus !== "sent" ||
                   original.deletedAt
                 ) {
                   sendJson(client, {
@@ -806,6 +936,7 @@ app.get(
                 );
                 if (
                   !original ||
+                  original.messageStatus !== "sent" ||
                   !(
                     (original.senderId === sender.id &&
                       original.receiverId === receiver.id) ||
@@ -828,11 +959,24 @@ app.get(
                 receiver.id,
                 message.message,
                 message.replyToMessageId,
+                message.type === "ghost.create",
               );
               const serverMessage: ServerMessage = {
                 type: "message.new",
                 message: storedMessage,
               };
+              if (message.type === "ghost.create") {
+                sendToUser(sender.id, {
+                  type: "ghost.updated",
+                  message: storedMessage,
+                });
+                chatStatus.stopTyping(
+                  sender.id,
+                  getClientKey(client),
+                  receiver.id,
+                );
+                return;
+              }
               sendToUser(sender.id, serverMessage);
               sendToUser(receiver.id, serverMessage);
               chatStatus.stopTyping(
@@ -888,5 +1032,17 @@ const port = Number(Bun.env.PORT ?? 3001);
 if (!Number.isInteger(port) || port < 1 || port > 65_535) {
   throw new Error("PORT must be an integer between 1 and 65535");
 }
+// Start background work only after binding succeeds. A duplicate development
+// process that fails to bind must not claim scheduled rows without recipients.
+const createServer = () => Bun.serve({ port, fetch: app.fetch, websocket });
+const serverRuntime = globalThis as typeof globalThis & {
+  pbMessengerServer?: ReturnType<typeof createServer>;
+};
+if (serverRuntime.pbMessengerServer) {
+  serverRuntime.pbMessengerServer.reload({ fetch: app.fetch, websocket });
+} else {
+  serverRuntime.pbMessengerServer = createServer();
+}
+export const server = serverRuntime.pbMessengerServer;
+startGhostScheduler(publishReleasedGhost);
 console.info(`Realtime chat backend listening on http://localhost:${port}`);
-export default { port, fetch: app.fetch, websocket };
