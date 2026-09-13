@@ -33,7 +33,10 @@ export type PrivateMessage = {
   receiverId: string;
   messageText: string;
   createdAt: string;
+  readAt: string | null;
 };
+
+export type UnreadCount = { friendId: string; unreadCount: number };
 
 export type User = {
   id: string;
@@ -59,6 +62,7 @@ type PrivateMessageRow = {
   receiverId: string;
   messageText: string;
   createdAt: Date | string;
+  readAt: Date | string | null;
 };
 
 type UserRow = {
@@ -109,6 +113,7 @@ const normalizePrivateMessage = (row: PrivateMessageRow): PrivateMessage => ({
   receiverId: row.receiverId,
   messageText: row.messageText,
   createdAt: toIsoString(row.createdAt),
+  readAt: row.readAt ? toIsoString(row.readAt) : null,
 });
 
 const normalizeUser = (row: UserRow): User => ({
@@ -188,6 +193,12 @@ export const initializeDatabase = async () => {
   await database`
     ALTER TABLE messages
     ADD COLUMN IF NOT EXISTS receiver_id BIGINT REFERENCES users(id) ON DELETE CASCADE
+  `;
+  await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ`;
+  await database`
+    CREATE INDEX IF NOT EXISTS messages_unread_receiver_sender_idx
+    ON messages (receiver_id, sender_id, id)
+    WHERE read_at IS NULL AND receiver_id IS NOT NULL
   `;
   await database`CREATE INDEX IF NOT EXISTS messages_created_at_id_idx ON messages (created_at DESC, id DESC)`;
   await database`
@@ -466,7 +477,8 @@ export const createPrivateMessage = async (
       sender_id::text AS "senderId",
       receiver_id::text AS "receiverId",
       message_text AS "messageText",
-      created_at AS "createdAt"
+      created_at AS "createdAt",
+      read_at AS "readAt"
   `;
   if (!message)
     throw new Error("PostgreSQL did not return the inserted private message");
@@ -478,14 +490,15 @@ export const getPrivateMessages = async (
   otherUserId: string,
 ): Promise<PrivateMessage[]> => {
   const messages = await database<PrivateMessageRow[]>`
-    SELECT id, "senderId", "receiverId", "messageText", "createdAt"
+    SELECT id, "senderId", "receiverId", "messageText", "createdAt", "readAt"
     FROM (
       SELECT
         id::text AS id,
         sender_id::text AS "senderId",
         receiver_id::text AS "receiverId",
         message_text AS "messageText",
-        created_at AS "createdAt"
+        created_at AS "createdAt",
+        read_at AS "readAt"
       FROM messages
       WHERE
         (sender_id = ${currentUserId} AND receiver_id = ${otherUserId})
@@ -496,6 +509,49 @@ export const getPrivateMessages = async (
     ORDER BY "createdAt" ASC, id::bigint ASC
   `;
   return messages.map(normalizePrivateMessage);
+};
+
+export const getUnreadCounts = async (
+  receiverId: string,
+): Promise<UnreadCount[]> => database<UnreadCount[]>`
+  SELECT
+    messages.sender_id::text AS "friendId",
+    count(*)::integer AS "unreadCount"
+  FROM messages
+  JOIN friend_requests ON friend_requests.status = 'accepted'
+    AND LEAST(friend_requests.sender_id, friend_requests.receiver_id)
+      = LEAST(messages.sender_id, messages.receiver_id)
+    AND GREATEST(friend_requests.sender_id, friend_requests.receiver_id)
+      = GREATEST(messages.sender_id, messages.receiver_id)
+  WHERE messages.receiver_id = ${receiverId}
+    AND messages.sender_id <> ${receiverId}
+    AND messages.read_at IS NULL
+  GROUP BY messages.sender_id
+`;
+
+// The boundary must itself be an incoming message owned by this receiver.
+// This avoids marking messages sent concurrently after the visible history read.
+export const markMessagesRead = async (
+  receiverId: string,
+  senderId: string,
+  throughMessageId: string,
+): Promise<{ readAt: string | null } | null> => {
+  const [boundary] = await database<{ id: string }[]>`
+    SELECT id::text AS id FROM messages
+    WHERE id::text = ${throughMessageId}
+      AND receiver_id = ${receiverId} AND sender_id = ${senderId}
+  `;
+  if (!boundary) return null;
+  const [result] = await database<{ readAt: Date | string | null }[]>`
+    WITH updated AS (
+      UPDATE messages SET read_at = NOW()
+      WHERE receiver_id = ${receiverId} AND sender_id = ${senderId}
+        AND id <= ${boundary.id} AND read_at IS NULL
+      RETURNING read_at
+    )
+    SELECT max(read_at) AS "readAt" FROM updated
+  `;
+  return { readAt: result?.readAt ? toIsoString(result.readAt) : null };
 };
 
 export const getRecentMessages = async (): Promise<StoredMessage[]> => {

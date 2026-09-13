@@ -16,6 +16,7 @@ import {
   findUserByEmail,
   findUserBySession,
   getFriends,
+  getUnreadCounts,
   getFriendshipStatus,
   getPrivateMessages,
   getReceivedFriendRequests,
@@ -30,6 +31,11 @@ import {
   type PublicUser,
   type StoredMessage,
 } from "./database";
+import {
+  ChatStatusTracker,
+  type StatusClientEvent,
+  type StatusServerEvent,
+} from "./chat-status";
 
 const MAX_MESSAGE_LENGTH = 1_000;
 const MIN_PASSWORD_LENGTH = 8;
@@ -47,15 +53,17 @@ const secureCookies =
 type Variables = { user: PublicUser };
 type ClientMessage =
   | { type: "message.send"; receiverId: string; message: string }
-  | { type: "message.send.global"; message: string };
+  | { type: "message.send.global"; message: string }
+  | StatusClientEvent;
 type ServerMessage =
   | { type: "message.new"; message: PrivateMessage }
   | { type: "message.new"; data: StoredMessage }
-  | { type: "error"; data: { message: string } };
+  | StatusServerEvent;
 
 const app = new Hono<{ Variables: Variables }>();
 const connectionsByUser = new Map<string, Set<WSContext>>();
 const authenticatedClients = new Map<unknown, PublicUser>();
+const clientEventQueues = new Map<unknown, Promise<void>>();
 const getClientKey = (client: WSContext): unknown => client.raw ?? client;
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
@@ -131,7 +139,27 @@ const parseClientMessage = (rawValue: unknown): ClientMessage | null => {
   if (typeof rawValue !== "string") return null;
   try {
     const value: unknown = JSON.parse(rawValue);
-    if (!isRecord(value) || value.type !== "message.send") return null;
+    if (!isRecord(value)) return null;
+    const isId = (id: unknown): id is string =>
+      typeof id === "string" &&
+      /^[1-9]\d{0,18}$/.test(id) &&
+      BigInt(id) <= 9_223_372_036_854_775_807n;
+    if (value.type === "chat.sync") return { type: "chat.sync" };
+    if (value.type === "message.read") {
+      return isId(value.friendId) && isId(value.throughMessageId)
+        ? {
+            type: "message.read",
+            friendId: value.friendId,
+            throughMessageId: value.throughMessageId,
+          }
+        : null;
+    }
+    if (value.type === "typing.start" || value.type === "typing.stop") {
+      return isId(value.receiverId)
+        ? { type: value.type, receiverId: value.receiverId }
+        : null;
+    }
+    if (value.type !== "message.send") return null;
 
     if (isRecord(value.data) && typeof value.data.text === "string") {
       const legacyMessage = value.data.text.trim();
@@ -166,19 +194,26 @@ const sendJson = (client: WSContext, message: ServerMessage) => {
 
 const addConnection = (user: PublicUser, client: WSContext) => {
   const connections = connectionsByUser.get(user.id) ?? new Set<WSContext>();
+  const firstConnection = connections.size === 0;
   connections.add(client);
   connectionsByUser.set(user.id, connections);
   authenticatedClients.set(getClientKey(client), user);
+  chatStatus.connected(user, client, firstConnection);
 };
 
 const removeConnection = (client: WSContext) => {
   const key = getClientKey(client);
   const user = authenticatedClients.get(key);
   authenticatedClients.delete(key);
+  clientEventQueues.delete(key);
   if (!user) return;
   const connections = connectionsByUser.get(user.id);
-  connections?.delete(client);
+  // Hono creates a fresh WSContext wrapper for each callback; match the raw socket.
+  for (const connection of connections ?? []) {
+    if (getClientKey(connection) === key) connections?.delete(connection);
+  }
   if (connections?.size === 0) connectionsByUser.delete(user.id);
+  chatStatus.disconnected(user.id, client, !connectionsByUser.has(user.id));
 };
 
 const sendToUser = (userId: string, message: ServerMessage) => {
@@ -190,6 +225,14 @@ const sendToUser = (userId: string, message: ServerMessage) => {
 const sendToAllUsers = (message: ServerMessage) => {
   for (const userId of connectionsByUser.keys()) sendToUser(userId, message);
 };
+
+const chatStatus = new ChatStatusTracker({
+  keyFor: getClientKey,
+  clientsFor: (userId) => connectionsByUser.get(userId) ?? [],
+  isOnline: (userId) => (connectionsByUser.get(userId)?.size ?? 0) > 0,
+  sendToUser,
+  sendToClient: sendJson,
+});
 
 await initializeDatabase();
 
@@ -384,7 +427,21 @@ app.get("/api/users", requireAuth, async (context) => {
 
 app.get("/api/friends", requireAuth, async (context) => {
   try {
-    return context.json({ friends: await getFriends(context.get("user").id) });
+    const userId = context.get("user").id;
+    const [friends, counts] = await Promise.all([
+      getFriends(userId),
+      getUnreadCounts(userId),
+    ]);
+    const unread = new Map(
+      counts.map((count) => [count.friendId, count.unreadCount]),
+    );
+    return context.json({
+      friends: friends.map((friend) => ({
+        ...friend,
+        unreadCount: unread.get(friend.id) ?? 0,
+        online: (connectionsByUser.get(friend.id)?.size ?? 0) > 0,
+      })),
+    });
   } catch (error) {
     console.error("Failed to load friends", error);
     return context.json({ error: "Friends could not be loaded." }, 500);
@@ -544,6 +601,8 @@ app.get(
   "/ws",
   upgradeWebSocket((context) => {
     const user = context.get("user");
+    const token = getCookie(context, SESSION_COOKIE);
+    const sessionHash = token ? hashSessionToken(token) : null;
     return {
       onOpen(_event, client) {
         addConnection(user, client);
@@ -551,84 +610,142 @@ app.get(
           `WebSocket connected for user ${user.id} (${authenticatedClients.size} total)`,
         );
       },
-      async onMessage(event, client) {
-        const message = parseClientMessage(event.data);
-        if (!message) {
-          sendJson(client, {
-            type: "error",
-            data: {
-              message: `Invalid message. Text must be 1-${MAX_MESSAGE_LENGTH} characters.`,
-            },
-          });
-          return;
-        }
-        const sender = authenticatedClients.get(getClientKey(client));
-        if (!sender) {
-          sendJson(client, {
-            type: "error",
-            data: { message: "Your session is not authenticated." },
-          });
-          return;
-        }
-        if (message.type === "message.send.global") {
-          try {
-            const storedMessage = await createMessage(
-              sender.username,
-              message.message,
-            );
-            sendToAllUsers({ type: "message.new", data: storedMessage });
-          } catch (error) {
-            console.error("Failed to save legacy global message", error);
+      onMessage(event, client) {
+        const key = getClientKey(client);
+        const queued = clientEventQueues.get(key) ?? Promise.resolve();
+        const task = queued
+          .then(async () => {
+            const message = parseClientMessage(event.data);
+            if (!message) {
+              sendJson(client, {
+                type: "error",
+                data: {
+                  message: `Invalid message. Text must be 1-${MAX_MESSAGE_LENGTH} characters.`,
+                },
+              });
+              return;
+            }
+            const registered = authenticatedClients.get(getClientKey(client));
+            const verified =
+              registered && sessionHash
+                ? await findUserBySession(sessionHash)
+                : null;
+            const sender = verified ? toPublicUser(verified) : null;
+            if (!sender) {
+              sendJson(client, {
+                type: "error",
+                data: { message: "Your session is not authenticated." },
+              });
+              client.close(1008, "Session expired");
+              removeConnection(client);
+              return;
+            }
+            if (
+              message.type === "chat.sync" ||
+              message.type === "message.read" ||
+              message.type === "typing.start" ||
+              message.type === "typing.stop"
+            ) {
+              try {
+                await chatStatus.handle(message, sender, client);
+              } catch (error) {
+                console.error("Failed to update chat status", error);
+                sendJson(client, {
+                  type: "error",
+                  data: {
+                    message:
+                      "Chat status could not be updated. Please try again.",
+                  },
+                });
+              }
+              return;
+            }
+            if (message.type === "message.send.global") {
+              try {
+                const storedMessage = await createMessage(
+                  sender.username,
+                  message.message,
+                );
+                sendToAllUsers({ type: "message.new", data: storedMessage });
+              } catch (error) {
+                console.error("Failed to save legacy global message", error);
+                sendJson(client, {
+                  type: "error",
+                  data: {
+                    message: "Message could not be saved. Please try again.",
+                  },
+                });
+              }
+              return;
+            }
+            if (message.receiverId === sender.id) {
+              sendJson(client, {
+                type: "error",
+                data: { message: "You cannot send a message to yourself." },
+              });
+              return;
+            }
+            try {
+              const receiver = await findChatUserById(message.receiverId);
+              if (!receiver) {
+                sendJson(client, {
+                  type: "error",
+                  data: { message: "The selected user was not found." },
+                });
+                return;
+              }
+              if (!(await areFriends(sender.id, receiver.id))) {
+                sendJson(client, {
+                  type: "error",
+                  data: { message: "You can only message accepted friends." },
+                });
+                return;
+              }
+              const storedMessage = await createPrivateMessage(
+                { id: sender.id, username: sender.username } satisfies ChatUser,
+                receiver.id,
+                message.message,
+              );
+              const serverMessage: ServerMessage = {
+                type: "message.new",
+                message: storedMessage,
+              };
+              sendToUser(sender.id, serverMessage);
+              sendToUser(receiver.id, serverMessage);
+              chatStatus.stopTyping(
+                sender.id,
+                getClientKey(client),
+                receiver.id,
+              );
+              await chatStatus
+                .publishUnread(receiver.id)
+                .catch((error) =>
+                  console.error("Failed to publish unread counts", error),
+                );
+            } catch (error) {
+              console.error("Failed to save private message", error);
+              sendJson(client, {
+                type: "error",
+                data: {
+                  message: "Message could not be saved. Please try again.",
+                },
+              });
+            }
+          })
+          .catch((error) => {
+            console.error("Failed to process WebSocket event", error);
             sendJson(client, {
               type: "error",
               data: {
-                message: "Message could not be saved. Please try again.",
+                message: "Event could not be processed. Please try again.",
               },
             });
-          }
-          return;
-        }
-        if (message.receiverId === sender.id) {
-          sendJson(client, {
-            type: "error",
-            data: { message: "You cannot send a message to yourself." },
           });
-          return;
-        }
-        try {
-          const receiver = await findChatUserById(message.receiverId);
-          if (!receiver) {
-            sendJson(client, {
-              type: "error",
-              data: { message: "The selected user was not found." },
-            });
-            return;
-          }
-          if (!(await areFriends(sender.id, receiver.id))) {
-            sendJson(client, {
-              type: "error",
-              data: { message: "You can only message accepted friends." },
-            });
-            return;
-          }
-          const storedMessage = await createPrivateMessage(
-            { id: sender.id, username: sender.username } satisfies ChatUser,
-            receiver.id,
-            message.message,
-          );
-          const serverMessage: ServerMessage = {
-            type: "message.new",
-            message: storedMessage,
-          };
-          sendToUser(sender.id, serverMessage);
-          sendToUser(receiver.id, serverMessage);
-        } catch (error) {
-          console.error("Failed to save private message", error);
-          sendJson(client, {
-            type: "error",
-            data: { message: "Message could not be saved. Please try again." },
-          });
-        }
+        clientEventQueues.set(key, task);
+        void task.then(() => {
+          if (clientEventQueues.get(key) === task)
+            clientEventQueues.delete(key);
+        });
       },
       onClose(_event, client) {
         removeConnection(client);
