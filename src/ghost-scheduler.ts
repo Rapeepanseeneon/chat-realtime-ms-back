@@ -1,9 +1,9 @@
-import { releaseDueGhosts, type PrivateMessage } from "./database";
+import { releaseDueGhosts, publishPendingGhosts } from "./database";
 
 // Durable schedules live in PostgreSQL. Poll overdue rows on startup too, so
 // downtime delays delivery but does not lose the schedule. No browser timers.
 export const startGhostScheduler = (
-  publish: (message: PrivateMessage) => Promise<void>,
+  publish: Parameters<typeof publishPendingGhosts>[0],
 ) => {
   const runtime = globalThis as typeof globalThis & {
     pbGhostTimer?: ReturnType<typeof setInterval>;
@@ -14,18 +14,24 @@ export const startGhostScheduler = (
     if (running) return;
     running = true;
     try {
-      const released = await releaseDueGhosts();
-      for (const message of released) await publish(message);
+      try {
+        await releaseDueGhosts();
+      } catch (error) {
+        console.error("Failed to release scheduled ghosts; will retry", error);
+      }
+      // Previously committed releases must retry even when a new release fails.
+      await publishPendingGhosts(publish);
     } catch (error) {
       console.error("Failed to release scheduled ghosts", error);
     } finally {
       running = false;
     }
   };
-  runtime.pbGhostTimer = setInterval(() => void tick(), 1000);
+  const timer = setInterval(() => void tick(), 1000);
+  runtime.pbGhostTimer = timer;
   void tick();
   return () => {
-    clearInterval(runtime.pbGhostTimer);
-    runtime.pbGhostTimer = undefined;
+    clearInterval(timer);
+    if (runtime.pbGhostTimer === timer) runtime.pbGhostTimer = undefined;
   };
 };

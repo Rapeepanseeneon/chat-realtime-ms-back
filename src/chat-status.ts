@@ -137,10 +137,10 @@ export class ChatStatusTracker {
     });
   }
 
-  async publishUnread(userId: string) {
+  async publishUnread(userId: string, pool?: import("bun").SQL) {
     // Assign before the query. Clients discard out-of-order snapshots.
     const revision = this.nextUnreadRevision(userId);
-    const counts = await getUnreadCounts(userId);
+    const counts = await getUnreadCounts(userId, pool);
     this.transport.sendToUser(userId, {
       type: "unread.update",
       counts,

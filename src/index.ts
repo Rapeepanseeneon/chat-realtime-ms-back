@@ -1,4 +1,5 @@
 import { Hono, type Context, type Next } from "hono";
+import type { SQL } from "bun";
 import { upgradeWebSocket, websocket } from "hono/bun";
 import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
@@ -12,6 +13,7 @@ import {
   mutatePrivateMessage,
   updateGhost,
   releaseGhost,
+  publishPendingGhosts,
   createSession,
   createUser,
   deleteSession,
@@ -308,14 +310,13 @@ const chatStatus = new ChatStatusTracker({
 });
 
 await initializeDatabase();
-const publishReleasedGhost = async (message: PrivateMessage) => {
+const publishReleasedGhost = async (
+  message: PrivateMessage,
+  transaction: SQL,
+) => {
   sendToUser(message.senderId, { type: "message.new", message });
   sendToUser(message.receiverId, { type: "message.new", message });
-  await chatStatus
-    .publishUnread(message.receiverId)
-    .catch((error) =>
-      console.error("Failed to publish released ghost unread count", error),
-    );
+  await chatStatus.publishUnread(message.receiverId, transaction);
 };
 
 app.use(
@@ -803,7 +804,7 @@ app.get(
               }
               if (message.type === "ghost.release") {
                 const released = await releaseGhost(original.id, sender.id);
-                if (released) await publishReleasedGhost(released);
+                if (released) await publishPendingGhosts(publishReleasedGhost);
                 else
                   sendJson(client, {
                     type: "error",

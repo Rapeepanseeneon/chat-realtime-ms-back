@@ -250,6 +250,8 @@ export const initializeDatabase = async () => {
   await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ`;
   await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS state_updated_at TIMESTAMPTZ`;
   await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_id BIGINT`;
+  await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS ghost_publish_pending BOOLEAN NOT NULL DEFAULT FALSE`;
+  await database`CREATE INDEX IF NOT EXISTS messages_pending_ghost_publish_idx ON messages (id) WHERE ghost_publish_pending = TRUE`;
   await database.begin(async (transaction) => {
     await transaction`ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_status_valid`;
     await transaction`ALTER TABLE messages ADD CONSTRAINT messages_status_valid CHECK (
@@ -583,7 +585,7 @@ const selectPrivateMessages = async (
       AND original.message_status = 'sent'
       AND ((original.sender_id = m.sender_id AND original.receiver_id = m.receiver_id)
         OR (original.sender_id = m.receiver_id AND original.receiver_id = m.sender_id))
-    WHERE m.id IN ${database(ids)} AND m.receiver_id IS NOT NULL AND m.sender_id IS NOT NULL
+    WHERE m.id IN ${pool(ids)} AND m.receiver_id IS NOT NULL AND m.sender_id IS NOT NULL
       AND (${viewerId}::bigint IS NULL OR m.message_status = 'sent' OR m.sender_id = ${viewerId}::bigint)
     ORDER BY COALESCE(m.released_at, m.created_at) ASC, m.id ASC
   `;
@@ -639,27 +641,35 @@ export const releaseGhost = async (
   messageId: string,
   ownerId: string,
 ): Promise<PrivateMessage | null> => {
-  const [released] = await database<{ id: string }[]>`
+  return database.begin(async (transaction) => {
+    const [released] = await transaction<{ id: string }[]>`
     UPDATE messages m SET message_status = 'sent', released_at = clock_timestamp(),
       delivery_id = nextval(pg_get_serial_sequence('messages', 'id')),
-      state_updated_at = clock_timestamp(), scheduled_at = NULL, read_at = NULL
+      state_updated_at = clock_timestamp(), scheduled_at = NULL, read_at = NULL,
+      ghost_publish_pending = TRUE
     WHERE m.id = ${messageId} AND m.sender_id = ${ownerId}
-      AND m.message_status IN ('ghost', 'scheduled') AND m.deleted_at IS NULL
+      AND m.message_status IN ('ghost', 'scheduled') AND m.deleted_at IS NULL AND m.released_at IS NULL
       AND EXISTS (SELECT 1 FROM friend_requests f WHERE f.status = 'accepted'
         AND LEAST(f.sender_id, f.receiver_id) = LEAST(m.sender_id, m.receiver_id)
         AND GREATEST(f.sender_id, f.receiver_id) = GREATEST(m.sender_id, m.receiver_id))
     RETURNING m.id::text AS id
   `;
-  return released ? findPrivateMessage(released.id) : null;
+    return released
+      ? ((await selectPrivateMessages([released.id], null, transaction))[0] ??
+          null)
+      : null;
+  });
 };
 
-export const releaseDueGhosts = async (): Promise<PrivateMessage[]> => {
-  const ids = await database.begin(async (transaction) => {
+export const releaseDueGhosts = async (
+  pool = database,
+): Promise<PrivateMessage[]> => {
+  return pool.begin(async (transaction) => {
     const released = await transaction<{ id: string }[]>`
       WITH due AS (
         SELECT m.id FROM messages m
         WHERE m.message_status = 'scheduled' AND m.scheduled_at <= clock_timestamp()
-          AND m.deleted_at IS NULL
+          AND m.deleted_at IS NULL AND m.released_at IS NULL
           AND EXISTS (SELECT 1 FROM friend_requests f WHERE f.status = 'accepted'
             AND LEAST(f.sender_id, f.receiver_id) = LEAST(m.sender_id, m.receiver_id)
             AND GREATEST(f.sender_id, f.receiver_id) = GREATEST(m.sender_id, m.receiver_id))
@@ -667,13 +677,51 @@ export const releaseDueGhosts = async (): Promise<PrivateMessage[]> => {
       )
       UPDATE messages m SET message_status = 'sent', released_at = clock_timestamp(),
         delivery_id = nextval(pg_get_serial_sequence('messages', 'id')),
-        state_updated_at = clock_timestamp(), scheduled_at = NULL, read_at = NULL
+        state_updated_at = clock_timestamp(), scheduled_at = NULL, read_at = NULL,
+        ghost_publish_pending = TRUE
       FROM due WHERE m.id = due.id
       RETURNING m.id::text AS id
     `;
-    return released.map((row) => row.id);
+    // Hydration must succeed before commit, otherwise the release rolls back.
+    return selectPrivateMessages(
+      released.map((row) => row.id),
+      null,
+      transaction,
+    );
   });
-  return selectPrivateMessages(ids);
+};
+
+// A small PostgreSQL outbox on the message row: sent is durable independently
+// of realtime. A crash/error before acknowledgement leaves this flag retryable.
+export const publishPendingGhosts = async (
+  publish: (message: PrivateMessage, transaction: SQL) => Promise<void>,
+  pool = database,
+) => {
+  const pending = await pool<{ id: string }[]>`
+    SELECT id::text AS id FROM messages WHERE ghost_publish_pending = TRUE
+    ORDER BY id LIMIT 50
+  `;
+  for (const { id } of pending) {
+    try {
+      await pool.begin(async (transaction) => {
+        const locked = await transaction<{ id: string }[]>`
+          SELECT id::text AS id FROM messages
+          WHERE id = ${id} AND ghost_publish_pending = TRUE AND message_status = 'sent'
+          FOR UPDATE SKIP LOCKED
+        `;
+        if (!locked.length) return;
+        const [message] = await selectPrivateMessages([id], null, transaction);
+        if (!message) throw new Error("Released ghost could not be loaded");
+        await publish(message, transaction);
+        await transaction`UPDATE messages SET ghost_publish_pending = FALSE WHERE id = ${id}`;
+      });
+    } catch (error) {
+      console.error(
+        `Failed to publish released ghost ${id}; will retry`,
+        error,
+      );
+    }
+  }
 };
 
 export const mutatePrivateMessage = async (
@@ -724,7 +772,8 @@ export const getPrivateMessages = async (
 
 export const getUnreadCounts = async (
   receiverId: string,
-): Promise<UnreadCount[]> => database<UnreadCount[]>`
+  pool = database,
+): Promise<UnreadCount[]> => pool<UnreadCount[]>`
   SELECT
     messages.sender_id::text AS "friendId",
     count(*)::integer AS "unreadCount"
