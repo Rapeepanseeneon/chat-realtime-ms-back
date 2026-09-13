@@ -34,6 +34,16 @@ export type PrivateMessage = {
   messageText: string;
   createdAt: string;
   readAt: string | null;
+  editedAt: string | null;
+  deletedAt: string | null;
+  replyToMessageId: string | null;
+  reply: {
+    id: string;
+    senderId: string;
+    messageText: string;
+    editedAt: string | null;
+    deletedAt: string | null;
+  } | null;
 };
 
 export type UnreadCount = { friendId: string; unreadCount: number };
@@ -63,6 +73,13 @@ type PrivateMessageRow = {
   messageText: string;
   createdAt: Date | string;
   readAt: Date | string | null;
+  editedAt: Date | string | null;
+  deletedAt: Date | string | null;
+  replyToMessageId: string | null;
+  replySenderId: string | null;
+  replyText: string | null;
+  replyEditedAt: Date | string | null;
+  replyDeletedAt: Date | string | null;
 };
 
 type UserRow = {
@@ -114,6 +131,21 @@ const normalizePrivateMessage = (row: PrivateMessageRow): PrivateMessage => ({
   messageText: row.messageText,
   createdAt: toIsoString(row.createdAt),
   readAt: row.readAt ? toIsoString(row.readAt) : null,
+  editedAt: row.editedAt ? toIsoString(row.editedAt) : null,
+  deletedAt: row.deletedAt ? toIsoString(row.deletedAt) : null,
+  replyToMessageId: row.replyToMessageId,
+  reply:
+    row.replyToMessageId && row.replySenderId
+      ? {
+          id: row.replyToMessageId,
+          senderId: row.replySenderId,
+          messageText: row.replyDeletedAt ? "" : (row.replyText ?? ""),
+          editedAt: row.replyEditedAt ? toIsoString(row.replyEditedAt) : null,
+          deletedAt: row.replyDeletedAt
+            ? toIsoString(row.replyDeletedAt)
+            : null,
+        }
+      : null,
 });
 
 const normalizeUser = (row: UserRow): User => ({
@@ -195,6 +227,14 @@ export const initializeDatabase = async () => {
     ADD COLUMN IF NOT EXISTS receiver_id BIGINT REFERENCES users(id) ON DELETE CASCADE
   `;
   await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ`;
+  await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ`;
+  await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`;
+  await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_message_id BIGINT REFERENCES messages(id) ON DELETE SET NULL`;
+  // Preserve the legacy nonblank rule; only tombstones may have erased content.
+  await database.begin(async (transaction) => {
+    await transaction`ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_message_text_not_blank`;
+    await transaction`ALTER TABLE messages ADD CONSTRAINT messages_message_text_not_blank CHECK (deleted_at IS NOT NULL OR char_length(btrim(message_text)) BETWEEN 1 AND 1000)`;
+  });
   await database`
     CREATE INDEX IF NOT EXISTS messages_unread_receiver_sender_idx
     ON messages (receiver_id, sender_id, id)
@@ -468,47 +508,93 @@ export const createPrivateMessage = async (
   sender: ChatUser,
   receiverId: string,
   messageText: string,
+  replyToMessageId: string | null = null,
 ): Promise<PrivateMessage> => {
-  const [message] = await database<PrivateMessageRow[]>`
-    INSERT INTO messages (sender_name, sender_id, receiver_id, message_text)
-    VALUES (${sender.username}, ${sender.id}, ${receiverId}, ${messageText})
-    RETURNING
-      id::text AS id,
-      sender_id::text AS "senderId",
-      receiver_id::text AS "receiverId",
-      message_text AS "messageText",
-      created_at AS "createdAt",
-      read_at AS "readAt"
+  const [message] = await database<{ id: string }[]>`
+    INSERT INTO messages (sender_name, sender_id, receiver_id, message_text, reply_to_message_id)
+    SELECT ${sender.username}, ${sender.id}, ${receiverId}, ${messageText}, ${replyToMessageId}::bigint
+    WHERE ${replyToMessageId}::bigint IS NULL OR EXISTS (
+      SELECT 1 FROM messages original WHERE original.id = ${replyToMessageId}::bigint
+        AND ((original.sender_id = ${sender.id} AND original.receiver_id = ${receiverId})
+          OR (original.sender_id = ${receiverId} AND original.receiver_id = ${sender.id}))
+    )
+    RETURNING id::text AS id
   `;
   if (!message)
-    throw new Error("PostgreSQL did not return the inserted private message");
-  return normalizePrivateMessage(message);
+    throw new Error("Reply must reference a message in this conversation.");
+  const stored = await findPrivateMessage(message.id);
+  if (!stored) throw new Error("Private message was not found after saving.");
+  return stored;
+};
+
+// Join the current original, rather than persisting a stale copy of reply content.
+const selectPrivateMessages = async (
+  ids: string[],
+): Promise<PrivateMessage[]> => {
+  if (!ids.length) return [];
+  const rows = await database<PrivateMessageRow[]>`
+    SELECT m.id::text AS id, m.sender_id::text AS "senderId",
+      m.receiver_id::text AS "receiverId",
+      CASE WHEN m.deleted_at IS NULL THEN m.message_text ELSE '' END AS "messageText",
+      m.created_at AS "createdAt", m.read_at AS "readAt",
+      m.edited_at AS "editedAt", m.deleted_at AS "deletedAt",
+      m.reply_to_message_id::text AS "replyToMessageId",
+      original.sender_id::text AS "replySenderId",
+      CASE WHEN original.deleted_at IS NULL THEN original.message_text ELSE '' END AS "replyText",
+      original.edited_at AS "replyEditedAt", original.deleted_at AS "replyDeletedAt"
+    FROM messages m
+    LEFT JOIN messages original ON original.id = m.reply_to_message_id
+      AND ((original.sender_id = m.sender_id AND original.receiver_id = m.receiver_id)
+        OR (original.sender_id = m.receiver_id AND original.receiver_id = m.sender_id))
+    WHERE m.id IN ${database(ids)} AND m.receiver_id IS NOT NULL AND m.sender_id IS NOT NULL
+    ORDER BY m.created_at ASC, m.id ASC
+  `;
+  return rows.map(normalizePrivateMessage);
+};
+
+export const findPrivateMessage = async (
+  messageId: string,
+): Promise<PrivateMessage | null> =>
+  (await selectPrivateMessages([messageId]))[0] ?? null;
+
+export const mutatePrivateMessage = async (
+  messageId: string,
+  ownerId: string,
+  action: "edit" | "delete",
+  text = "",
+): Promise<PrivateMessage | null> => {
+  // Ownership and tombstone checks also belong in the atomic UPDATE.
+  const rows =
+    action === "edit"
+      ? await database<{ id: string }[]>`
+        UPDATE messages SET message_text = ${text}, edited_at = clock_timestamp()
+        WHERE id = ${messageId} AND sender_id = ${ownerId}
+          AND receiver_id IS NOT NULL AND deleted_at IS NULL
+        RETURNING id::text AS id
+      `
+      : await database<{ id: string }[]>`
+        UPDATE messages SET message_text = '', deleted_at = clock_timestamp()
+        WHERE id = ${messageId} AND sender_id = ${ownerId}
+          AND receiver_id IS NOT NULL AND deleted_at IS NULL
+        RETURNING id::text AS id
+      `;
+  return rows[0] ? findPrivateMessage(rows[0].id) : null;
 };
 
 export const getPrivateMessages = async (
   currentUserId: string,
   otherUserId: string,
 ): Promise<PrivateMessage[]> => {
-  const messages = await database<PrivateMessageRow[]>`
-    SELECT id, "senderId", "receiverId", "messageText", "createdAt", "readAt"
-    FROM (
-      SELECT
-        id::text AS id,
-        sender_id::text AS "senderId",
-        receiver_id::text AS "receiverId",
-        message_text AS "messageText",
-        created_at AS "createdAt",
-        read_at AS "readAt"
+  const messages = await database<{ id: string }[]>`
+      SELECT id::text AS id
       FROM messages
       WHERE
         (sender_id = ${currentUserId} AND receiver_id = ${otherUserId})
         OR (sender_id = ${otherUserId} AND receiver_id = ${currentUserId})
       ORDER BY created_at DESC, id DESC
       LIMIT 50
-    ) AS recent_private_messages
-    ORDER BY "createdAt" ASC, id::bigint ASC
   `;
-  return messages.map(normalizePrivateMessage);
+  return selectPrivateMessages(messages.map((message) => message.id));
 };
 
 export const getUnreadCounts = async (
@@ -526,6 +612,7 @@ export const getUnreadCounts = async (
   WHERE messages.receiver_id = ${receiverId}
     AND messages.sender_id <> ${receiverId}
     AND messages.read_at IS NULL
+    AND messages.deleted_at IS NULL
   GROUP BY messages.sender_id
 `;
 

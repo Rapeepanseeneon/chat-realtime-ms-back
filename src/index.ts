@@ -8,6 +8,8 @@ import {
   createFriendRequest,
   createMessage,
   createPrivateMessage,
+  findPrivateMessage,
+  mutatePrivateMessage,
   createSession,
   createUser,
   deleteSession,
@@ -52,11 +54,19 @@ const secureCookies =
 
 type Variables = { user: PublicUser };
 type ClientMessage =
-  | { type: "message.send"; receiverId: string; message: string }
+  | {
+      type: "message.send";
+      receiverId: string;
+      message: string;
+      replyToMessageId: string | null;
+    }
+  | { type: "message.edit"; messageId: string; message: string }
+  | { type: "message.delete"; messageId: string }
   | { type: "message.send.global"; message: string }
   | StatusClientEvent;
 type ServerMessage =
   | { type: "message.new"; message: PrivateMessage }
+  | { type: "message.edited" | "message.deleted"; message: PrivateMessage }
   | { type: "message.new"; data: StoredMessage }
   | StatusServerEvent;
 
@@ -145,6 +155,20 @@ const parseClientMessage = (rawValue: unknown): ClientMessage | null => {
       /^[1-9]\d{0,18}$/.test(id) &&
       BigInt(id) <= 9_223_372_036_854_775_807n;
     if (value.type === "chat.sync") return { type: "chat.sync" };
+    if (value.type === "message.delete") {
+      return isId(value.messageId)
+        ? { type: "message.delete", messageId: value.messageId }
+        : null;
+    }
+    if (value.type === "message.edit") {
+      const message =
+        typeof value.message === "string" ? value.message.trim() : "";
+      return isId(value.messageId) &&
+        message.length > 0 &&
+        message.length <= MAX_MESSAGE_LENGTH
+        ? { type: "message.edit", messageId: value.messageId, message }
+        : null;
+    }
     if (value.type === "message.read") {
       return isId(value.friendId) && isId(value.throughMessageId)
         ? {
@@ -176,9 +200,19 @@ const parseClientMessage = (rawValue: unknown): ClientMessage | null => {
     }
     const receiverId = value.receiverId.trim();
     const message = value.message.trim();
-    if (!/^\d+$/.test(receiverId)) return null;
+    if (!isId(receiverId)) return null;
     if (!message || message.length > MAX_MESSAGE_LENGTH) return null;
-    return { type: "message.send", receiverId, message };
+    if (value.replyToMessageId != null && !isId(value.replyToMessageId))
+      return null;
+    return {
+      type: "message.send",
+      receiverId,
+      message,
+      replyToMessageId:
+        value.replyToMessageId == null
+          ? null
+          : (value.replyToMessageId as string),
+    };
   } catch {
     return null;
   }
@@ -678,6 +712,71 @@ app.get(
               }
               return;
             }
+            if (
+              message.type === "message.edit" ||
+              message.type === "message.delete"
+            ) {
+              try {
+                const original = await findPrivateMessage(message.messageId);
+                if (
+                  !original ||
+                  original.senderId !== sender.id ||
+                  original.deletedAt
+                ) {
+                  sendJson(client, {
+                    type: "error",
+                    data: {
+                      message:
+                        "You can only edit or delete your own undeleted messages.",
+                    },
+                  });
+                  return;
+                }
+                if (!(await areFriends(sender.id, original.receiverId))) {
+                  sendJson(client, {
+                    type: "error",
+                    data: {
+                      message:
+                        "You can only update messages with accepted friends.",
+                    },
+                  });
+                  return;
+                }
+                const updated = await mutatePrivateMessage(
+                  original.id,
+                  sender.id,
+                  message.type === "message.edit" ? "edit" : "delete",
+                  message.type === "message.edit" ? message.message : "",
+                );
+                if (!updated) {
+                  sendJson(client, {
+                    type: "error",
+                    data: { message: "This message can no longer be updated." },
+                  });
+                  return;
+                }
+                const update: ServerMessage = {
+                  type:
+                    message.type === "message.edit"
+                      ? "message.edited"
+                      : "message.deleted",
+                  message: updated,
+                };
+                sendToUser(updated.senderId, update);
+                sendToUser(updated.receiverId, update);
+                if (message.type === "message.delete")
+                  await chatStatus.publishUnread(updated.receiverId);
+              } catch (error) {
+                console.error("Failed to update private message", error);
+                sendJson(client, {
+                  type: "error",
+                  data: {
+                    message: "Message could not be updated. Please try again.",
+                  },
+                });
+              }
+              return;
+            }
             if (message.receiverId === sender.id) {
               sendJson(client, {
                 type: "error",
@@ -701,10 +800,34 @@ app.get(
                 });
                 return;
               }
+              if (message.replyToMessageId) {
+                const original = await findPrivateMessage(
+                  message.replyToMessageId,
+                );
+                if (
+                  !original ||
+                  !(
+                    (original.senderId === sender.id &&
+                      original.receiverId === receiver.id) ||
+                    (original.senderId === receiver.id &&
+                      original.receiverId === sender.id)
+                  )
+                ) {
+                  sendJson(client, {
+                    type: "error",
+                    data: {
+                      message:
+                        "Reply must reference a message in this conversation.",
+                    },
+                  });
+                  return;
+                }
+              }
               const storedMessage = await createPrivateMessage(
                 { id: sender.id, username: sender.username } satisfies ChatUser,
                 receiver.id,
                 message.message,
+                message.replyToMessageId,
               );
               const serverMessage: ServerMessage = {
                 type: "message.new",
