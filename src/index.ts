@@ -32,10 +32,24 @@ import {
   searchUsers,
   toPublicUser,
   updateUser,
+  createGroup,
+  getGroups,
+  getGroupInfo,
+  getGroupMessages,
+  getGroupMemberIds,
+  createGroupMessage,
+  mutateGroupMessage,
+  markGroupRead,
+  isGroupMember,
+  updateGroup,
+  addGroupMember,
+  removeGroupMember,
+  leaveGroup,
   type ChatUser,
   type PrivateMessage,
   type PublicUser,
   type StoredMessage,
+  type GroupMessage,
 } from "./database";
 import {
   ChatStatusTracker,
@@ -72,18 +86,45 @@ type ClientMessage =
   | { type: "ghost.release"; messageId: string }
   | { type: "ghost.schedule"; messageId: string; scheduledAt: string | null }
   | { type: "message.send.global"; message: string }
+  | {
+      type: "group.message.send";
+      groupId: string;
+      message: string;
+      replyToMessageId: string | null;
+    }
+  | { type: "group.message.edit"; messageId: string; message: string }
+  | { type: "group.message.delete"; messageId: string }
+  | { type: "group.read"; groupId: string }
+  | { type: "group.typing.start"; groupId: string }
+  | { type: "group.typing.stop"; groupId: string }
   | StatusClientEvent;
 type ServerMessage =
   | { type: "message.new"; message: PrivateMessage }
   | { type: "message.edited" | "message.deleted"; message: PrivateMessage }
   | { type: "ghost.updated"; message: PrivateMessage }
   | { type: "message.new"; data: StoredMessage }
+  | {
+      type:
+        "group.message.new" | "group.message.edited" | "group.message.deleted";
+      message: GroupMessage;
+    }
+  | { type: "group.updated"; groupId: string }
+  | {
+      type: "group.typing.start" | "group.typing.stop";
+      groupId: string;
+      userId: string;
+      username: string;
+    }
   | StatusServerEvent;
 
 const app = new Hono<{ Variables: Variables }>();
 const connectionsByUser = new Map<string, Set<WSContext>>();
 const authenticatedClients = new Map<unknown, PublicUser>();
 const clientEventQueues = new Map<unknown, Promise<void>>();
+const groupTyping = new Map<
+  unknown,
+  Map<string, ReturnType<typeof setTimeout>>
+>();
 const getClientKey = (client: WSContext): unknown => client.raw ?? client;
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
@@ -165,6 +206,45 @@ const parseClientMessage = (rawValue: unknown): ClientMessage | null => {
       /^[1-9]\d{0,18}$/.test(id) &&
       BigInt(id) <= 9_223_372_036_854_775_807n;
     if (value.type === "chat.sync") return { type: "chat.sync" };
+    if (
+      value.type === "group.read" ||
+      value.type === "group.typing.start" ||
+      value.type === "group.typing.stop"
+    )
+      return isId(value.groupId)
+        ? { type: value.type, groupId: value.groupId }
+        : null;
+    if (value.type === "group.message.delete")
+      return isId(value.messageId)
+        ? { type: value.type, messageId: value.messageId }
+        : null;
+    if (value.type === "group.message.edit") {
+      const message =
+        typeof value.message === "string" ? value.message.trim() : "";
+      return isId(value.messageId) &&
+        message.length > 0 &&
+        message.length <= MAX_MESSAGE_LENGTH
+        ? { type: value.type, messageId: value.messageId, message }
+        : null;
+    }
+    if (value.type === "group.message.send") {
+      const message =
+        typeof value.message === "string" ? value.message.trim() : "";
+      return isId(value.groupId) &&
+        message.length > 0 &&
+        message.length <= MAX_MESSAGE_LENGTH &&
+        (value.replyToMessageId == null || isId(value.replyToMessageId))
+        ? {
+            type: value.type,
+            groupId: value.groupId,
+            message,
+            replyToMessageId:
+              value.replyToMessageId == null
+                ? null
+                : (value.replyToMessageId as string),
+          }
+        : null;
+    }
     if (value.type === "ghost.schedule") {
       if (!isId(value.messageId)) return null;
       if (value.scheduledAt === null)
@@ -278,6 +358,22 @@ const addConnection = (user: PublicUser, client: WSContext) => {
 
 const removeConnection = (client: WSContext) => {
   const key = getClientKey(client);
+  for (const [groupId, timer] of groupTyping.get(key) ?? []) {
+    clearTimeout(timer);
+    const typingUser = authenticatedClients.get(key);
+    if (typingUser)
+      void broadcastToGroup(
+        groupId,
+        {
+          type: "group.typing.stop",
+          groupId,
+          userId: typingUser.id,
+          username: typingUser.username,
+        },
+        typingUser.id,
+      );
+  }
+  groupTyping.delete(key);
   const user = authenticatedClients.get(key);
   authenticatedClients.delete(key);
   clientEventQueues.delete(key);
@@ -299,6 +395,38 @@ const sendToUser = (userId: string, message: ServerMessage) => {
 
 const sendToAllUsers = (message: ServerMessage) => {
   for (const userId of connectionsByUser.keys()) sendToUser(userId, message);
+};
+
+const broadcastToGroup = async (
+  groupId: string,
+  message: ServerMessage,
+  excludeUserId?: string,
+) => {
+  for (const userId of await getGroupMemberIds(groupId))
+    if (userId !== excludeUserId) sendToUser(userId, message);
+};
+
+const stopGroupTyping = async (
+  client: WSContext,
+  user: PublicUser,
+  groupId: string,
+) => {
+  const key = getClientKey(client),
+    groups = groupTyping.get(key),
+    timer = groups?.get(groupId);
+  if (timer) clearTimeout(timer);
+  groups?.delete(groupId);
+  if (groups?.size === 0) groupTyping.delete(key);
+  await broadcastToGroup(
+    groupId,
+    {
+      type: "group.typing.stop",
+      groupId,
+      userId: user.id,
+      username: user.username,
+    },
+    user.id,
+  );
 };
 
 const chatStatus = new ChatStatusTracker({
@@ -642,6 +770,115 @@ app.put("/api/friend-requests/:requestId", requireAuth, async (context) => {
   }
 });
 
+app.get("/api/groups", requireAuth, async (context) => {
+  try {
+    return context.json({ groups: await getGroups(context.get("user").id) });
+  } catch (error) {
+    console.error("Failed to load groups", error);
+    return context.json({ error: "Groups could not be loaded." }, 500);
+  }
+});
+
+app.post("/api/groups", requireAuth, async (context) => {
+  const value = await readJson(context),
+    name = typeof value?.name === "string" ? value.name.trim() : "";
+  const memberIds = Array.isArray(value?.memberIds)
+    ? [
+        ...new Set(
+          value.memberIds.filter(
+            (id): id is string =>
+              typeof id === "string" && /^[1-9]\d{0,18}$/.test(id),
+          ),
+        ),
+      ]
+    : [];
+  if (
+    !name ||
+    name.length > 80 ||
+    memberIds.length > 50 ||
+    memberIds.length !==
+      (Array.isArray(value?.memberIds) ? value.memberIds.length : 0)
+  )
+    return context.json(
+      { error: "Enter a group name and select valid friends." },
+      400,
+    );
+  try {
+    const group = await createGroup(context.get("user").id, name, memberIds);
+    if (!group)
+      return context.json(
+        { error: "Groups may contain accepted friends only." },
+        403,
+      );
+    for (const id of group.members.map((member) => member.id))
+      sendToUser(id, { type: "group.updated", groupId: group.id });
+    return context.json({ group }, 201);
+  } catch (error) {
+    console.error("Failed to create group", error);
+    return context.json({ error: "Group could not be created." }, 500);
+  }
+});
+
+app.get("/api/groups/:groupId", requireAuth, async (context) => {
+  const id = context.req.param("groupId") ?? "";
+  if (!/^[1-9]\d{0,18}$/.test(id))
+    return context.json({ error: "Group not found." }, 404);
+  const group = await getGroupInfo(id, context.get("user").id);
+  return group
+    ? context.json({ group })
+    : context.json({ error: "Group not found." }, 404);
+});
+
+app.get("/api/groups/:groupId/messages", requireAuth, async (context) => {
+  const id = context.req.param("groupId") ?? "";
+  if (!/^[1-9]\d{0,18}$/.test(id))
+    return context.json({ error: "Group not found." }, 404);
+  const messages = await getGroupMessages(id, context.get("user").id);
+  return messages
+    ? context.json({ messages })
+    : context.json({ error: "You are not a member of this group." }, 403);
+});
+
+app.put("/api/groups/:groupId", requireAuth, async (context) => {
+  const groupId = context.req.param("groupId") ?? "",
+    userId = context.get("user").id,
+    value = await readJson(context),
+    action = value?.action;
+  if (!/^[1-9]\d{0,18}$/.test(groupId))
+    return context.json({ error: "Group not found." }, 404);
+  try {
+    const before = await getGroupMemberIds(groupId);
+    let ok = false;
+    if (action === "rename") {
+      const name = typeof value?.name === "string" ? value.name.trim() : "";
+      if (!name || name.length > 80)
+        return context.json(
+          { error: "Group name is required and may be at most 80 characters." },
+          400,
+        );
+      ok = await updateGroup(groupId, userId, name);
+    } else if (action === "add" || action === "remove") {
+      const target = typeof value?.userId === "string" ? value.userId : "";
+      if (!/^[1-9]\d{0,18}$/.test(target))
+        return context.json({ error: "Select a valid member." }, 400);
+      ok =
+        action === "add"
+          ? await addGroupMember(groupId, userId, target)
+          : await removeGroupMember(groupId, userId, target);
+    } else if (action === "leave") ok = await leaveGroup(groupId, userId);
+    else return context.json({ error: "Invalid group action." }, 400);
+    if (!ok)
+      return context.json({ error: "Group action is not allowed." }, 403);
+    const after = await getGroupMemberIds(groupId);
+    for (const id of new Set([...before, ...after]))
+      sendToUser(id, { type: "group.updated", groupId });
+    return context.json({ message: "Group updated." });
+  } catch (error) {
+    console.error("Failed to update group", error);
+    return context.json({ error: "Group could not be updated." }, 500);
+  }
+});
+
 // Never return even a ghost's existence to the receiver or another user.
 app.get("/api/ghosts/:messageId", requireAuth, async (context) => {
   const id = context.req.param("messageId") ?? "";
@@ -759,6 +996,123 @@ app.get(
                   },
                 });
               }
+              return;
+            }
+            if (message.type === "group.read") {
+              if (!(await markGroupRead(message.groupId, sender.id)))
+                sendJson(client, {
+                  type: "error",
+                  data: { message: "You are not a member of this group." },
+                });
+              else {
+                sendToUser(sender.id, {
+                  type: "group.updated",
+                  groupId: message.groupId,
+                });
+              }
+              return;
+            }
+            if (
+              message.type === "group.typing.start" ||
+              message.type === "group.typing.stop"
+            ) {
+              if (!(await isGroupMember(message.groupId, sender.id))) {
+                sendJson(client, {
+                  type: "error",
+                  data: { message: "You are not a member of this group." },
+                });
+                return;
+              }
+              if (message.type === "group.typing.stop")
+                await stopGroupTyping(client, sender, message.groupId);
+              else {
+                const key = getClientKey(client),
+                  groups = groupTyping.get(key) ?? new Map();
+                const existing = groups.get(message.groupId);
+                if (existing) clearTimeout(existing);
+                if (!existing)
+                  await broadcastToGroup(
+                    message.groupId,
+                    {
+                      type: "group.typing.start",
+                      groupId: message.groupId,
+                      userId: sender.id,
+                      username: sender.username,
+                    },
+                    sender.id,
+                  );
+                groups.set(
+                  message.groupId,
+                  setTimeout(
+                    () => void stopGroupTyping(client, sender, message.groupId),
+                    2500,
+                  ),
+                );
+                groupTyping.set(key, groups);
+              }
+              return;
+            }
+            if (
+              message.type === "group.message.edit" ||
+              message.type === "group.message.delete"
+            ) {
+              const updated = await mutateGroupMessage(
+                message.messageId,
+                sender.id,
+                message.type === "group.message.edit" ? "edit" : "delete",
+                message.type === "group.message.edit" ? message.message : "",
+              );
+              if (!updated) {
+                sendJson(client, {
+                  type: "error",
+                  data: {
+                    message:
+                      "You can only update your own undeleted group messages.",
+                  },
+                });
+                return;
+              }
+              await broadcastToGroup(updated.groupId, {
+                type:
+                  message.type === "group.message.edit"
+                    ? "group.message.edited"
+                    : "group.message.deleted",
+                message: updated,
+              });
+              for (const id of await getGroupMemberIds(updated.groupId))
+                sendToUser(id, {
+                  type: "group.updated",
+                  groupId: updated.groupId,
+                });
+              return;
+            }
+            if (message.type === "group.message.send") {
+              const stored = await createGroupMessage(
+                message.groupId,
+                sender.id,
+                message.message,
+                message.replyToMessageId,
+              );
+              if (!stored) {
+                sendJson(client, {
+                  type: "error",
+                  data: {
+                    message:
+                      "Group message was rejected. Check membership and reply target.",
+                  },
+                });
+                return;
+              }
+              await stopGroupTyping(client, sender, message.groupId);
+              await broadcastToGroup(message.groupId, {
+                type: "group.message.new",
+                message: stored,
+              });
+              for (const id of await getGroupMemberIds(message.groupId))
+                sendToUser(id, {
+                  type: "group.updated",
+                  groupId: message.groupId,
+                });
               return;
             }
             if (message.type === "message.send.global") {

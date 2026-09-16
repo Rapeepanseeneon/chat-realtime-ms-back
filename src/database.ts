@@ -53,6 +53,44 @@ export type PrivateMessage = {
 
 export type UnreadCount = { friendId: string; unreadCount: number };
 
+export type GroupSummary = {
+  id: string;
+  name: string;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
+  role: "owner" | "member";
+  memberCount: number;
+  unreadCount: number;
+};
+
+export type GroupMember = ChatUser & {
+  role: "owner" | "member";
+  joinedAt: string;
+};
+
+export type GroupInfo = GroupSummary & { members: GroupMember[] };
+
+export type GroupMessage = {
+  id: string;
+  groupId: string;
+  senderId: string;
+  senderUsername: string;
+  messageText: string;
+  createdAt: string;
+  editedAt: string | null;
+  deletedAt: string | null;
+  replyToMessageId: string | null;
+  reply: {
+    id: string;
+    senderId: string;
+    senderUsername: string;
+    messageText: string;
+    editedAt: string | null;
+    deletedAt: string | null;
+  } | null;
+};
+
 export type User = {
   id: string;
   username: string;
@@ -277,6 +315,35 @@ export const initializeDatabase = async () => {
     ON messages (sender_id, receiver_id, created_at DESC, id DESC)
     WHERE sender_id IS NOT NULL AND receiver_id IS NOT NULL
   `;
+  await database`CREATE TABLE IF NOT EXISTS groups (
+    id BIGSERIAL PRIMARY KEY, name VARCHAR(80) NOT NULL,
+    created_by BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT groups_name_not_blank CHECK (char_length(btrim(name)) BETWEEN 1 AND 80)
+  )`;
+  await database`CREATE TABLE IF NOT EXISTS group_members (
+    group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role VARCHAR(10) NOT NULL DEFAULT 'member', joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (group_id, user_id), CONSTRAINT group_members_role_valid CHECK (role IN ('owner','member'))
+  )`;
+  await database`CREATE UNIQUE INDEX IF NOT EXISTS group_single_owner_idx ON group_members(group_id) WHERE role='owner'`;
+  await database`CREATE INDEX IF NOT EXISTS group_members_user_idx ON group_members(user_id, group_id)`;
+  await database`CREATE TABLE IF NOT EXISTS group_messages (
+    id BIGSERIAL PRIMARY KEY, group_id BIGINT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    sender_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    message_text VARCHAR(1000) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    edited_at TIMESTAMPTZ, deleted_at TIMESTAMPTZ,
+    reply_to_message_id BIGINT REFERENCES group_messages(id) ON DELETE SET NULL,
+    CONSTRAINT group_messages_text_valid CHECK (deleted_at IS NOT NULL OR char_length(btrim(message_text)) BETWEEN 1 AND 1000)
+  )`;
+  await database`CREATE INDEX IF NOT EXISTS group_messages_history_idx ON group_messages(group_id, id DESC)`;
+  await database`CREATE TABLE IF NOT EXISTS group_reads (
+    group_id BIGINT NOT NULL, user_id BIGINT NOT NULL, last_read_message_id BIGINT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(group_id,user_id),
+    FOREIGN KEY(group_id,user_id) REFERENCES group_members(group_id,user_id) ON DELETE CASCADE,
+    FOREIGN KEY(last_read_message_id) REFERENCES group_messages(id) ON DELETE SET NULL
+  )`;
 };
 
 export const createUser = async (
@@ -804,6 +871,7 @@ export const markMessagesRead = async (
       AND receiver_id = ${receiverId} AND sender_id = ${senderId}
       AND message_status = 'sent'
   `;
+
   if (!boundary) return null;
   const [result] = await database<{ readAt: Date | string | null }[]>`
     WITH updated AS (
@@ -820,6 +888,249 @@ export const markMessagesRead = async (
     throughDeliveryId: boundary.deliveryId,
   };
 };
+
+type GroupSummaryRow = Omit<GroupSummary, "createdAt" | "updatedAt"> & {
+  createdAt: Date | string;
+  updatedAt: Date | string;
+};
+type GroupMessageRow = Omit<
+  GroupMessage,
+  "createdAt" | "editedAt" | "deletedAt" | "reply"
+> & {
+  createdAt: Date | string;
+  editedAt: Date | string | null;
+  deletedAt: Date | string | null;
+  replySenderId: string | null;
+  replySenderUsername: string | null;
+  replyText: string | null;
+  replyEditedAt: Date | string | null;
+  replyDeletedAt: Date | string | null;
+};
+const normalizeGroupSummary = (row: GroupSummaryRow): GroupSummary => ({
+  ...row,
+  createdAt: toIsoString(row.createdAt),
+  updatedAt: toIsoString(row.updatedAt),
+});
+const normalizeGroupMessage = (row: GroupMessageRow): GroupMessage => ({
+  id: row.id,
+  groupId: row.groupId,
+  senderId: row.senderId,
+  senderUsername: row.senderUsername,
+  messageText: row.deletedAt ? "" : row.messageText,
+  createdAt: toIsoString(row.createdAt),
+  editedAt: row.editedAt ? toIsoString(row.editedAt) : null,
+  deletedAt: row.deletedAt ? toIsoString(row.deletedAt) : null,
+  replyToMessageId: row.replyToMessageId,
+  reply:
+    row.replyToMessageId && row.replySenderId
+      ? {
+          id: row.replyToMessageId,
+          senderId: row.replySenderId,
+          senderUsername: row.replySenderUsername ?? "Unknown",
+          messageText: row.replyDeletedAt ? "" : (row.replyText ?? ""),
+          editedAt: row.replyEditedAt ? toIsoString(row.replyEditedAt) : null,
+          deletedAt: row.replyDeletedAt
+            ? toIsoString(row.replyDeletedAt)
+            : null,
+        }
+      : null,
+});
+
+export const getGroups = async (userId: string): Promise<GroupSummary[]> => {
+  const rows = await database<GroupSummaryRow[]>`
+    SELECT g.id::text id, g.name, g.created_by::text AS "createdBy", g.created_at AS "createdAt",
+      g.updated_at AS "updatedAt", mine.role, count(DISTINCT members.user_id)::integer AS "memberCount",
+      count(DISTINCT message.id) FILTER (WHERE message.id > COALESCE(reads.last_read_message_id, 0)
+        AND message.sender_id <> ${userId} AND message.deleted_at IS NULL)::integer AS "unreadCount"
+    FROM groups g JOIN group_members mine ON mine.group_id=g.id AND mine.user_id=${userId}
+    JOIN group_members members ON members.group_id=g.id
+    LEFT JOIN group_reads reads ON reads.group_id=g.id AND reads.user_id=${userId}
+    LEFT JOIN group_messages message ON message.group_id=g.id
+    GROUP BY g.id,mine.role,reads.last_read_message_id ORDER BY g.updated_at DESC,g.id DESC`;
+  return rows.map(normalizeGroupSummary);
+};
+
+export const isGroupMember = async (groupId: string, userId: string) =>
+  (
+    await database<
+      { ok: boolean }[]
+    >`SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id=${groupId} AND user_id=${userId}) ok`
+  )[0]?.ok ?? false;
+
+export const getGroupMemberIds = async (groupId: string): Promise<string[]> =>
+  (
+    await database<
+      { id: string }[]
+    >`SELECT user_id::text id FROM group_members WHERE group_id=${groupId}`
+  ).map((row) => row.id);
+
+export const getGroupInfo = async (
+  groupId: string,
+  viewerId: string,
+): Promise<GroupInfo | null> => {
+  const summary = (await getGroups(viewerId)).find(
+    (group) => group.id === groupId,
+  );
+  if (!summary) return null;
+  const rows = await database<(GroupMember & { joinedAt: Date | string })[]>`
+    SELECT u.id::text id,u.username,gm.role,gm.joined_at AS "joinedAt" FROM group_members gm
+    JOIN users u ON u.id=gm.user_id WHERE gm.group_id=${groupId} ORDER BY (gm.role='owner') DESC,gm.joined_at,u.id`;
+  return {
+    ...summary,
+    members: rows.map((row) => ({
+      ...row,
+      joinedAt: toIsoString(row.joinedAt),
+    })),
+  };
+};
+
+export const createGroup = async (
+  creatorId: string,
+  name: string,
+  memberIds: string[],
+): Promise<GroupInfo | null> => {
+  const unique = [...new Set(memberIds)].filter((id) => id !== creatorId);
+  return database
+    .begin(async (tx) => {
+      if (unique.length) {
+        const [{ count }] = await tx<
+          { count: number }[]
+        >`SELECT count(*)::integer count FROM users u WHERE u.id IN ${tx(unique)}
+        AND EXISTS(SELECT 1 FROM friend_requests f WHERE f.status='accepted'
+          AND LEAST(f.sender_id,f.receiver_id)=LEAST(${creatorId}::bigint,u.id)
+          AND GREATEST(f.sender_id,f.receiver_id)=GREATEST(${creatorId}::bigint,u.id))`;
+        if (count !== unique.length) return null;
+      }
+      const [group] = await tx<
+        { id: string }[]
+      >`INSERT INTO groups(name,created_by) VALUES(${name},${creatorId}) RETURNING id::text id`;
+      await tx`INSERT INTO group_members(group_id,user_id,role) VALUES(${group.id},${creatorId},'owner')`;
+      if (unique.length)
+        await tx`INSERT INTO group_members(group_id,user_id,role) SELECT ${group.id},id,'member' FROM users WHERE id IN ${tx(unique)}`;
+      return group.id;
+    })
+    .then((id) => (id ? getGroupInfo(id, creatorId) : null));
+};
+
+const selectGroupMessages = async (ids: string[]): Promise<GroupMessage[]> => {
+  if (!ids.length) return [];
+  const rows = await database<GroupMessageRow[]>`
+    SELECT m.id::text id,m.group_id::text AS "groupId",m.sender_id::text AS "senderId",u.username AS "senderUsername",
+      m.message_text AS "messageText",m.created_at AS "createdAt",m.edited_at AS "editedAt",m.deleted_at AS "deletedAt",
+      m.reply_to_message_id::text AS "replyToMessageId",r.sender_id::text AS "replySenderId",ru.username AS "replySenderUsername",
+      r.message_text AS "replyText",r.edited_at AS "replyEditedAt",r.deleted_at AS "replyDeletedAt"
+    FROM group_messages m JOIN users u ON u.id=m.sender_id
+    LEFT JOIN group_messages r ON r.id=m.reply_to_message_id AND r.group_id=m.group_id LEFT JOIN users ru ON ru.id=r.sender_id
+    WHERE m.id IN ${database(ids)} ORDER BY m.id`;
+  return rows.map(normalizeGroupMessage);
+};
+
+export const getGroupMessages = async (
+  groupId: string,
+  userId: string,
+): Promise<GroupMessage[] | null> => {
+  if (!(await isGroupMember(groupId, userId))) return null;
+  const rows = await database<
+    { id: string }[]
+  >`SELECT id::text id FROM group_messages WHERE group_id=${groupId} ORDER BY id DESC LIMIT 50`;
+  return selectGroupMessages(rows.reverse().map((row) => row.id));
+};
+
+export const createGroupMessage = async (
+  groupId: string,
+  senderId: string,
+  text: string,
+  replyId: string | null,
+): Promise<GroupMessage | null> => {
+  const [row] = await database<
+    { id: string }[]
+  >`INSERT INTO group_messages(group_id,sender_id,message_text,reply_to_message_id)
+    SELECT ${groupId},${senderId},${text},${replyId}::bigint WHERE EXISTS(SELECT 1 FROM group_members WHERE group_id=${groupId} AND user_id=${senderId})
+    AND (${replyId}::bigint IS NULL OR EXISTS(SELECT 1 FROM group_messages WHERE id=${replyId} AND group_id=${groupId})) RETURNING id::text id`;
+  if (!row) return null;
+  await database`UPDATE groups SET updated_at=clock_timestamp() WHERE id=${groupId}`;
+  return (await selectGroupMessages([row.id]))[0] ?? null;
+};
+
+export const mutateGroupMessage = async (
+  id: string,
+  userId: string,
+  action: "edit" | "delete",
+  text = "",
+): Promise<GroupMessage | null> => {
+  const rows =
+    action === "edit"
+      ? await database<
+          { id: string }[]
+        >`UPDATE group_messages SET message_text=${text},edited_at=clock_timestamp()
+    WHERE id=${id} AND sender_id=${userId} AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM group_members WHERE group_id=group_messages.group_id AND user_id=${userId}) RETURNING id::text id`
+      : await database<
+          { id: string }[]
+        >`UPDATE group_messages SET message_text='',deleted_at=clock_timestamp()
+    WHERE id=${id} AND sender_id=${userId} AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM group_members WHERE group_id=group_messages.group_id AND user_id=${userId}) RETURNING id::text id`;
+  return rows[0]
+    ? ((await selectGroupMessages([rows[0].id]))[0] ?? null)
+    : null;
+};
+
+export const markGroupRead = async (
+  groupId: string,
+  userId: string,
+): Promise<boolean> => {
+  const rows =
+    await database`INSERT INTO group_reads(group_id,user_id,last_read_message_id) SELECT ${groupId},${userId},max(m.id)
+    FROM group_members gm LEFT JOIN group_messages m ON m.group_id=gm.group_id WHERE gm.group_id=${groupId} AND gm.user_id=${userId}
+    GROUP BY gm.group_id,gm.user_id ON CONFLICT(group_id,user_id) DO UPDATE SET last_read_message_id=EXCLUDED.last_read_message_id,updated_at=clock_timestamp() RETURNING group_id`;
+  return rows.length > 0;
+};
+
+export const updateGroup = async (
+  groupId: string,
+  ownerId: string,
+  name: string,
+): Promise<boolean> =>
+  (
+    await database`UPDATE groups SET name=${name},updated_at=clock_timestamp() WHERE id=${groupId} AND EXISTS(SELECT 1 FROM group_members WHERE group_id=groups.id AND user_id=${ownerId} AND role='owner') RETURNING id`
+  ).length > 0;
+export const addGroupMember = async (
+  groupId: string,
+  ownerId: string,
+  userId: string,
+): Promise<boolean> =>
+  (
+    await database`INSERT INTO group_members(group_id,user_id,role) SELECT ${groupId},${userId},'member' WHERE EXISTS(SELECT 1 FROM group_members WHERE group_id=${groupId} AND user_id=${ownerId} AND role='owner') AND EXISTS(SELECT 1 FROM friend_requests WHERE status='accepted' AND LEAST(sender_id,receiver_id)=LEAST(${ownerId}::bigint,${userId}::bigint) AND GREATEST(sender_id,receiver_id)=GREATEST(${ownerId}::bigint,${userId}::bigint)) ON CONFLICT DO NOTHING RETURNING group_id`
+  ).length > 0;
+export const removeGroupMember = async (
+  groupId: string,
+  ownerId: string,
+  userId: string,
+): Promise<boolean> =>
+  (
+    await database`DELETE FROM group_members gm WHERE group_id=${groupId} AND user_id=${userId} AND role='member' AND EXISTS(SELECT 1 FROM group_members owner WHERE owner.group_id=gm.group_id AND owner.user_id=${ownerId} AND owner.role='owner') RETURNING group_id`
+  ).length > 0;
+export const leaveGroup = async (
+  groupId: string,
+  userId: string,
+): Promise<boolean> =>
+  database.begin(async (tx) => {
+    const members = await tx<
+      { userId: string; role: "owner" | "member" }[]
+    >`SELECT user_id::text AS "userId",role FROM group_members WHERE group_id=${groupId} ORDER BY joined_at,user_id FOR UPDATE`;
+    const leaving = members.find((member) => member.userId === userId);
+    if (!leaving) return false;
+    if (leaving.role === "owner") {
+      const next = members.find((member) => member.userId !== userId);
+      if (!next) {
+        await tx`DELETE FROM groups WHERE id=${groupId}`;
+        return true;
+      }
+      await tx`UPDATE group_members SET role='member' WHERE group_id=${groupId} AND user_id=${userId}`;
+      await tx`UPDATE group_members SET role='owner' WHERE group_id=${groupId} AND user_id=${next.userId}`;
+      await tx`UPDATE groups SET created_by=${next.userId},updated_at=clock_timestamp() WHERE id=${groupId}`;
+    }
+    await tx`DELETE FROM group_members WHERE group_id=${groupId} AND user_id=${userId}`;
+    return true;
+  });
 
 export const getRecentMessages = async (): Promise<StoredMessage[]> => {
   const messages = await database<MessageRow[]>`
