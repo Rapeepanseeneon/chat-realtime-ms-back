@@ -81,6 +81,9 @@ typings/
 .env
 .env.test
 
+# Local avatar storage (replaceable by object storage in production)
+storage/avatars/
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 

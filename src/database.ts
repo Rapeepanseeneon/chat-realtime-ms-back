@@ -10,6 +10,19 @@ export type StoredMessage = {
 export type ChatUser = {
   id: string;
   username: string;
+  avatarUrl: string | null;
+  bio: string;
+};
+
+export type ProfileLink = {
+  id: string;
+  platform: string;
+  label: string;
+  url: string;
+};
+
+export type PublicProfile = ChatUser & {
+  links: ProfileLink[];
 };
 
 export type FriendSearchResult = ChatUser & {
@@ -76,6 +89,7 @@ export type GroupMessage = {
   groupId: string;
   senderId: string;
   senderUsername: string;
+  senderAvatarUrl: string | null;
   messageText: string;
   createdAt: string;
   editedAt: string | null;
@@ -96,6 +110,8 @@ export type User = {
   username: string;
   email: string;
   passwordHash: string;
+  avatarUrl: string | null;
+  bio: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -135,6 +151,8 @@ type UserRow = {
   username: string;
   email: string;
   passwordHash: string;
+  avatarUrl: string | null;
+  bio: string;
   createdAt: Date | string;
   updatedAt: Date | string;
 };
@@ -143,6 +161,8 @@ type FriendRequestRow = {
   id: string;
   senderId: string;
   senderUsername: string;
+  senderAvatarUrl: string | null;
+  senderBio: string;
   createdAt: Date | string;
 };
 
@@ -206,6 +226,8 @@ const normalizeUser = (row: UserRow): User => ({
   username: row.username,
   email: row.email,
   passwordHash: row.passwordHash,
+  avatarUrl: row.avatarUrl,
+  bio: row.bio,
   createdAt: toIsoString(row.createdAt),
   updatedAt: toIsoString(row.updatedAt),
 });
@@ -230,6 +252,32 @@ export const initializeDatabase = async () => {
   `;
   await database`CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_unique_idx ON users (lower(username))`;
   await database`CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique_idx ON users (lower(email))`;
+  await database`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`;
+  await database`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio VARCHAR(150) NOT NULL DEFAULT ''`;
+  await database`
+    CREATE TABLE IF NOT EXISTS profile_links (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      platform VARCHAR(30) NOT NULL,
+      label VARCHAR(60) NOT NULL,
+      url TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT profile_links_platform_valid CHECK (char_length(btrim(platform)) BETWEEN 1 AND 30),
+      CONSTRAINT profile_links_label_valid CHECK (char_length(btrim(label)) BETWEEN 1 AND 60),
+      CONSTRAINT profile_links_url_valid CHECK (char_length(url) BETWEEN 8 AND 2048)
+    )
+  `;
+  await database`CREATE INDEX IF NOT EXISTS profile_links_user_idx ON profile_links(user_id, id)`;
+  await database`
+    CREATE TABLE IF NOT EXISTS favorite_friends (
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      friend_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY(user_id, friend_id),
+      CONSTRAINT favorite_friends_not_self CHECK (user_id <> friend_id)
+    )
+  `;
   await database`
     CREATE TABLE IF NOT EXISTS friend_requests (
       id BIGSERIAL PRIMARY KEY,
@@ -354,7 +402,7 @@ export const createUser = async (
   const [user] = await database<UserRow[]>`
     INSERT INTO users (username, email, password_hash)
     VALUES (${username}, ${email}, ${passwordHash})
-    RETURNING id::text AS id, username, email, password_hash AS "passwordHash", created_at AS "createdAt", updated_at AS "updatedAt"
+    RETURNING id::text AS id, username, email, password_hash AS "passwordHash", avatar_url AS "avatarUrl", bio, created_at AS "createdAt", updated_at AS "updatedAt"
   `;
   if (!user) throw new Error("PostgreSQL did not return the inserted user");
   return normalizeUser(user);
@@ -362,27 +410,52 @@ export const createUser = async (
 
 export const findUserByEmail = async (email: string): Promise<User | null> => {
   const [user] = await database<UserRow[]>`
-    SELECT id::text AS id, username, email, password_hash AS "passwordHash", created_at AS "createdAt", updated_at AS "updatedAt"
+    SELECT id::text AS id, username, email, password_hash AS "passwordHash", avatar_url AS "avatarUrl", bio, created_at AS "createdAt", updated_at AS "updatedAt"
     FROM users WHERE lower(email) = lower(${email}) LIMIT 1
   `;
   return user ? normalizeUser(user) : null;
 };
 
+export type FriendListUser = ChatUser & {
+  favorite: boolean;
+  recentAt: string | null;
+};
+
 export const getFriends = async (
   currentUserId: string,
-): Promise<ChatUser[]> => {
-  return database<ChatUser[]>`
-    SELECT users.id::text AS id, users.username
+): Promise<FriendListUser[]> => {
+  const rows = await database<
+    (FriendListUser & { recentAt: Date | string | null })[]
+  >`
+    SELECT users.id::text AS id, users.username, users.avatar_url AS "avatarUrl", users.bio,
+      (favorite.friend_id IS NOT NULL) AS favorite,
+      GREATEST(private_recent.recent_at, group_recent.recent_at) AS "recentAt"
     FROM friend_requests
     JOIN users ON users.id = CASE
       WHEN friend_requests.sender_id = ${currentUserId}
         THEN friend_requests.receiver_id
       ELSE friend_requests.sender_id
     END
+    LEFT JOIN favorite_friends favorite ON favorite.user_id = ${currentUserId} AND favorite.friend_id = users.id
+    LEFT JOIN LATERAL (
+      SELECT max(created_at) AS recent_at FROM messages
+      WHERE message_status = 'sent' AND deleted_at IS NULL AND
+        ((sender_id = ${currentUserId} AND receiver_id = users.id) OR
+         (sender_id = users.id AND receiver_id = ${currentUserId}))
+    ) private_recent ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT max(gm.created_at) AS recent_at FROM group_messages gm
+      JOIN group_members mine ON mine.group_id = gm.group_id AND mine.user_id = ${currentUserId}
+      JOIN group_members theirs ON theirs.group_id = gm.group_id AND theirs.user_id = users.id
+    ) group_recent ON TRUE
     WHERE friend_requests.status = 'accepted'
       AND (${currentUserId} = friend_requests.sender_id OR ${currentUserId} = friend_requests.receiver_id)
-    ORDER BY lower(users.username) ASC, users.id ASC
+    ORDER BY favorite DESC, "recentAt" DESC NULLS LAST, lower(users.username), users.id
   `;
+  return rows.map((row) => ({
+    ...row,
+    recentAt: row.recentAt ? toIsoString(row.recentAt) : null,
+  }));
 };
 
 export const searchUsers = async (
@@ -392,7 +465,7 @@ export const searchUsers = async (
   return database<FriendSearchResult[]>`
     SELECT
       users.id::text AS id,
-      users.username,
+      users.username, users.avatar_url AS "avatarUrl", users.bio,
       CASE
         WHEN friend_requests.status = 'accepted' THEN 'friends'
         WHEN friend_requests.status = 'pending'
@@ -427,6 +500,8 @@ export const getReceivedFriendRequests = async (
       friend_requests.id::text AS id,
       users.id::text AS "senderId",
       users.username AS "senderUsername",
+      users.avatar_url AS "senderAvatarUrl",
+      users.bio AS "senderBio",
       friend_requests.created_at AS "createdAt"
     FROM friend_requests
     JOIN users ON users.id = friend_requests.sender_id
@@ -436,7 +511,12 @@ export const getReceivedFriendRequests = async (
   `;
   return rows.map((row) => ({
     id: row.id,
-    sender: { id: row.senderId, username: row.senderUsername },
+    sender: {
+      id: row.senderId,
+      username: row.senderUsername,
+      avatarUrl: row.senderAvatarUrl,
+      bio: row.senderBio,
+    },
     createdAt: toIsoString(row.createdAt),
   }));
 };
@@ -516,7 +596,7 @@ export const findChatUserById = async (
   userId: string,
 ): Promise<ChatUser | null> => {
   const [user] = await database<ChatUser[]>`
-    SELECT id::text AS id, username
+    SELECT id::text AS id, username, avatar_url AS "avatarUrl", bio
     FROM users
     WHERE id::text = ${userId}
     LIMIT 1
@@ -554,14 +634,92 @@ export const updateUser = async (
   userId: string,
   username: string,
   email: string,
+  bio = "",
 ): Promise<User> => {
   const [user] = await database<UserRow[]>`
-    UPDATE users SET username = ${username}, email = ${email}, updated_at = NOW()
+    UPDATE users SET username = ${username}, email = ${email}, bio = ${bio}, updated_at = NOW()
     WHERE id = ${userId}
-    RETURNING id::text AS id, username, email, password_hash AS "passwordHash", created_at AS "createdAt", updated_at AS "updatedAt"
+    RETURNING id::text AS id, username, email, password_hash AS "passwordHash", avatar_url AS "avatarUrl", bio, created_at AS "createdAt", updated_at AS "updatedAt"
   `;
   if (!user) throw new Error("User was not found");
   return normalizeUser(user);
+};
+
+export const getProfileLinks = async (userId: string): Promise<ProfileLink[]> =>
+  database<ProfileLink[]>`
+    SELECT id::text AS id, platform, label, url
+    FROM profile_links WHERE user_id = ${userId}
+    ORDER BY id
+  `;
+
+export const replaceProfileLinks = async (
+  userId: string,
+  links: Omit<ProfileLink, "id">[],
+) => {
+  await database.begin(async (transaction) => {
+    await transaction`DELETE FROM profile_links WHERE user_id = ${userId}`;
+    for (const link of links) {
+      await transaction`
+        INSERT INTO profile_links(user_id, platform, label, url)
+        VALUES(${userId}, ${link.platform}, ${link.label}, ${link.url})
+      `;
+    }
+  });
+};
+
+export const getPublicProfile = async (
+  viewerId: string,
+  profileUserId: string,
+): Promise<PublicProfile | null> => {
+  if (
+    viewerId !== profileUserId &&
+    !(await areFriends(viewerId, profileUserId))
+  )
+    return null;
+  const [user] = await database<ChatUser[]>`
+    SELECT id::text AS id, username, avatar_url AS "avatarUrl", bio
+    FROM users WHERE id = ${profileUserId} LIMIT 1
+  `;
+  return user ? { ...user, links: await getProfileLinks(profileUserId) } : null;
+};
+
+export const setUserAvatar = async (
+  userId: string,
+  avatarUrl: string | null,
+): Promise<{ user: User; previousAvatarUrl: string | null }> => {
+  const [previous] = await database<{ avatarUrl: string | null }[]>`
+    SELECT avatar_url AS "avatarUrl" FROM users WHERE id = ${userId}
+  `;
+  const [user] = await database<UserRow[]>`
+    UPDATE users SET avatar_url = ${avatarUrl}, updated_at = NOW()
+    WHERE id = ${userId}
+    RETURNING id::text AS id, username, email, password_hash AS "passwordHash",
+      avatar_url AS "avatarUrl", bio, created_at AS "createdAt", updated_at AS "updatedAt"
+  `;
+  if (!user) throw new Error("User was not found");
+  return {
+    user: normalizeUser(user),
+    previousAvatarUrl: previous?.avatarUrl ?? null,
+  };
+};
+
+export const setFavoriteFriend = async (
+  userId: string,
+  friendId: string,
+  favorite: boolean,
+): Promise<boolean> => {
+  if (!(await areFriends(userId, friendId))) return false;
+  if (favorite)
+    await database`
+      INSERT INTO favorite_friends(user_id, friend_id)
+      VALUES(${userId}, ${friendId}) ON CONFLICT DO NOTHING
+    `;
+  else
+    await database`
+      DELETE FROM favorite_friends
+      WHERE user_id = ${userId} AND friend_id = ${friendId}
+    `;
+  return true;
 };
 
 export const createSession = async (
@@ -577,7 +735,8 @@ export const findUserBySession = async (
 ): Promise<User | null> => {
   const [user] = await database<UserRow[]>`
     SELECT users.id::text AS id, users.username, users.email,
-      users.password_hash AS "passwordHash", users.created_at AS "createdAt", users.updated_at AS "updatedAt"
+      users.password_hash AS "passwordHash", users.avatar_url AS "avatarUrl", users.bio,
+      users.created_at AS "createdAt", users.updated_at AS "updatedAt"
     FROM sessions JOIN users ON users.id = sessions.user_id
     WHERE sessions.token_hash = ${tokenHash} AND sessions.expires_at > NOW()
     LIMIT 1
@@ -916,6 +1075,7 @@ const normalizeGroupMessage = (row: GroupMessageRow): GroupMessage => ({
   groupId: row.groupId,
   senderId: row.senderId,
   senderUsername: row.senderUsername,
+  senderAvatarUrl: row.senderAvatarUrl,
   messageText: row.deletedAt ? "" : row.messageText,
   createdAt: toIsoString(row.createdAt),
   editedAt: row.editedAt ? toIsoString(row.editedAt) : null,
@@ -973,7 +1133,7 @@ export const getGroupInfo = async (
   );
   if (!summary) return null;
   const rows = await database<(GroupMember & { joinedAt: Date | string })[]>`
-    SELECT u.id::text id,u.username,gm.role,gm.joined_at AS "joinedAt" FROM group_members gm
+    SELECT u.id::text id,u.username,u.avatar_url AS "avatarUrl",u.bio,gm.role,gm.joined_at AS "joinedAt" FROM group_members gm
     JOIN users u ON u.id=gm.user_id WHERE gm.group_id=${groupId} ORDER BY (gm.role='owner') DESC,gm.joined_at,u.id`;
   return {
     ...summary,
@@ -1015,7 +1175,7 @@ export const createGroup = async (
 const selectGroupMessages = async (ids: string[]): Promise<GroupMessage[]> => {
   if (!ids.length) return [];
   const rows = await database<GroupMessageRow[]>`
-    SELECT m.id::text id,m.group_id::text AS "groupId",m.sender_id::text AS "senderId",u.username AS "senderUsername",
+    SELECT m.id::text id,m.group_id::text AS "groupId",m.sender_id::text AS "senderId",u.username AS "senderUsername",u.avatar_url AS "senderAvatarUrl",
       m.message_text AS "messageText",m.created_at AS "createdAt",m.edited_at AS "editedAt",m.deleted_at AS "deletedAt",
       m.reply_to_message_id::text AS "replyToMessageId",r.sender_id::text AS "replySenderId",ru.username AS "replySenderUsername",
       r.message_text AS "replyText",r.edited_at AS "replyEditedAt",r.deleted_at AS "replyDeletedAt"

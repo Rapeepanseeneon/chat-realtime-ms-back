@@ -1,5 +1,7 @@
 import { Hono, type Context, type Next } from "hono";
 import type { SQL } from "bun";
+import { mkdir, unlink } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { upgradeWebSocket, websocket } from "hono/bun";
 import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
@@ -32,6 +34,11 @@ import {
   searchUsers,
   toPublicUser,
   updateUser,
+  getProfileLinks,
+  replaceProfileLinks,
+  getPublicProfile,
+  setUserAvatar,
+  setFavoriteFriend,
   createGroup,
   getGroups,
   getGroupInfo,
@@ -61,11 +68,17 @@ import { startGhostScheduler } from "./ghost-scheduler";
 const MAX_MESSAGE_LENGTH = 1_000;
 const MIN_PASSWORD_LENGTH = 8;
 const MAX_PASSWORD_LENGTH = 128;
+const MAX_BIO_LENGTH = 150;
+const MAX_AVATAR_BYTES = 5 * 1024 * 1024;
 const SESSION_DURATION_SECONDS = 60 * 60 * 24 * 7;
 const SESSION_COOKIE = "pb_session";
 const frontendUrl = (Bun.env.FRONTEND_URL ?? "http://localhost:3000").replace(
   /\/$/,
   "",
+);
+const avatarStorageDirectory = join(
+  process.cwd(),
+  Bun.env.AVATAR_STORAGE_DIR?.trim() || "storage/avatars",
 );
 const secureCookies =
   Bun.env.COOKIE_SECURE === "true" ||
@@ -154,6 +167,7 @@ const validateProfile = (value: Record<string, unknown>) => {
     typeof value.username === "string" ? value.username.trim() : "";
   const email =
     typeof value.email === "string" ? value.email.trim().toLowerCase() : "";
+  const bio = typeof value.bio === "string" ? value.bio.trim() : "";
 
   if (!username) return { error: "Username is required." } as const;
   if (username.length > 50)
@@ -161,7 +175,64 @@ const validateProfile = (value: Record<string, unknown>) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
     return { error: "Please enter a valid email address." } as const;
   }
-  return { username, email } as const;
+  if (bio.length > MAX_BIO_LENGTH)
+    return {
+      error: `Bio must be ${MAX_BIO_LENGTH} characters or fewer.`,
+    } as const;
+  return { username, email, bio } as const;
+};
+
+const validateProfileLinks = (value: unknown) => {
+  if (!Array.isArray(value) || value.length > 8) return null;
+  const links: { platform: string; label: string; url: string }[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) return null;
+    const platform =
+      typeof item.platform === "string" ? item.platform.trim() : "";
+    const label = typeof item.label === "string" ? item.label.trim() : "";
+    const rawUrl = typeof item.url === "string" ? item.url.trim() : "";
+    if (
+      !platform ||
+      platform.length > 30 ||
+      !label ||
+      label.length > 60 ||
+      rawUrl.length > 2048
+    )
+      return null;
+    try {
+      const url = new URL(rawUrl);
+      if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+      links.push({ platform, label, url: url.toString() });
+    } catch {
+      return null;
+    }
+  }
+  return links;
+};
+
+const avatarKind = (bytes: Uint8Array) => {
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff)
+    return { extension: "jpg", type: "image/jpeg" };
+  if (
+    bytes.length >= 8 &&
+    bytes
+      .slice(0, 8)
+      .every((byte, index) => byte === [137, 80, 78, 71, 13, 10, 26, 10][index])
+  )
+    return { extension: "png", type: "image/png" };
+  if (
+    new TextDecoder().decode(bytes.slice(0, 4)) === "RIFF" &&
+    new TextDecoder().decode(bytes.slice(8, 12)) === "WEBP"
+  )
+    return { extension: "webp", type: "image/webp" };
+  return null;
+};
+
+const removeStoredAvatar = async (avatarUrl: string | null) => {
+  if (!avatarUrl?.startsWith("/uploads/avatars/")) return;
+  const filename = basename(avatarUrl);
+  if (!/^[a-zA-Z0-9-]+\.(?:jpg|png|webp)$/.test(filename)) return;
+  await unlink(join(avatarStorageDirectory, filename)).catch(() => undefined);
 };
 
 const getAuthenticatedUser = async (
@@ -451,7 +522,7 @@ app.use(
   "/api/*",
   cors({
     origin: frontendUrl,
-    allowMethods: ["GET", "POST", "PUT", "OPTIONS"],
+    allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type"],
     credentials: true,
   }),
@@ -464,6 +535,20 @@ app.get("/", (context) =>
 app.get("/health", (context) =>
   context.json({ status: "ok", connectedClients: authenticatedClients.size }),
 );
+app.get("/uploads/avatars/:filename", async (context) => {
+  const filename = context.req.param("filename");
+  if (!/^[a-zA-Z0-9-]+\.(?:jpg|png|webp)$/.test(filename))
+    return context.notFound();
+  const file = Bun.file(join(avatarStorageDirectory, filename));
+  if (!(await file.exists())) return context.notFound();
+  return new Response(file, {
+    headers: {
+      "Content-Type": file.type || "application/octet-stream",
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+});
 
 app.post("/api/auth/register", async (context) => {
   const value = await readJson(context);
@@ -572,6 +657,21 @@ app.post("/api/auth/logout", async (context) => {
   return context.json({ message: "Logged out successfully." });
 });
 
+app.get("/api/profile", requireAuth, async (context) => {
+  const user = context.get("user");
+  return context.json({ user, links: await getProfileLinks(user.id) });
+});
+
+app.get("/api/profiles/:userId", requireAuth, async (context) => {
+  const userId = context.req.param("userId") ?? "";
+  if (!/^[1-9]\d{0,18}$/.test(userId))
+    return context.json({ error: "Profile was not found." }, 404);
+  const profile = await getPublicProfile(context.get("user").id, userId);
+  return profile
+    ? context.json({ profile })
+    : context.json({ error: "Profile was not found." }, 404);
+});
+
 app.put("/api/profile", requireAuth, async (context) => {
   const value = await readJson(context);
   if (!value)
@@ -581,6 +681,13 @@ app.put("/api/profile", requireAuth, async (context) => {
     );
   const profile = validateProfile(value);
   if ("error" in profile) return context.json({ error: profile.error }, 400);
+  const links =
+    value.links === undefined ? undefined : validateProfileLinks(value.links);
+  if (links === null)
+    return context.json(
+      { error: "Add up to 8 valid http or https profile links." },
+      400,
+    );
   const currentUser = context.get("user");
   const conflict = await findConflictingUser(
     profile.username,
@@ -600,9 +707,12 @@ app.put("/api/profile", requireAuth, async (context) => {
       currentUser.id,
       profile.username,
       profile.email,
+      profile.bio,
     );
+    if (links) await replaceProfileLinks(currentUser.id, links);
     return context.json({
       user: toPublicUser(user),
+      links: links ?? (await getProfileLinks(currentUser.id)),
       message: "Profile updated successfully.",
     });
   } catch (error) {
@@ -621,6 +731,61 @@ app.put("/api/profile", requireAuth, async (context) => {
       );
     return context.json(
       { error: "Profile could not be updated. Please try again." },
+      500,
+    );
+  }
+});
+
+app.post("/api/profile/avatar", requireAuth, async (context) => {
+  let uploadedPath: string | null = null;
+  try {
+    const form = await context.req.formData();
+    const file = form.get("avatar");
+    if (
+      !(file instanceof File) ||
+      file.size < 1 ||
+      file.size > MAX_AVATAR_BYTES
+    )
+      return context.json({ error: "Choose an image up to 5 MB." }, 400);
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const kind = avatarKind(bytes);
+    if (!kind || !["image/jpeg", "image/png", "image/webp"].includes(file.type))
+      return context.json(
+        { error: "Avatar must be a JPG, PNG, or WebP image." },
+        400,
+      );
+    await mkdir(avatarStorageDirectory, { recursive: true });
+    const filename = `${context.get("user").id}-${crypto.randomUUID()}.${kind.extension}`;
+    uploadedPath = `/uploads/avatars/${filename}`;
+    await Bun.write(join(avatarStorageDirectory, filename), bytes);
+    const result = await setUserAvatar(context.get("user").id, uploadedPath);
+    await removeStoredAvatar(result.previousAvatarUrl);
+    return context.json({
+      user: toPublicUser(result.user),
+      message: "Profile picture updated.",
+    });
+  } catch (error) {
+    if (uploadedPath) await removeStoredAvatar(uploadedPath);
+    console.error("Failed to update avatar", error);
+    return context.json(
+      { error: "Profile picture could not be updated." },
+      500,
+    );
+  }
+});
+
+app.delete("/api/profile/avatar", requireAuth, async (context) => {
+  try {
+    const result = await setUserAvatar(context.get("user").id, null);
+    await removeStoredAvatar(result.previousAvatarUrl);
+    return context.json({
+      user: toPublicUser(result.user),
+      message: "Profile picture removed.",
+    });
+  } catch (error) {
+    console.error("Failed to remove avatar", error);
+    return context.json(
+      { error: "Profile picture could not be removed." },
       500,
     );
   }
@@ -657,6 +822,21 @@ app.get("/api/friends", requireAuth, async (context) => {
     console.error("Failed to load friends", error);
     return context.json({ error: "Friends could not be loaded." }, 500);
   }
+});
+
+app.put("/api/friends/:friendId/favorite", requireAuth, async (context) => {
+  const friendId = context.req.param("friendId") ?? "";
+  const value = await readJson(context);
+  if (!/^[1-9]\d{0,18}$/.test(friendId) || typeof value?.favorite !== "boolean")
+    return context.json({ error: "Invalid favorite preference." }, 400);
+  const saved = await setFavoriteFriend(
+    context.get("user").id,
+    friendId,
+    value.favorite,
+  );
+  return saved
+    ? context.json({ favorite: value.favorite })
+    : context.json({ error: "Only accepted friends can be favorited." }, 403);
 });
 
 app.get("/api/friends/search", requireAuth, async (context) => {
@@ -1310,7 +1490,12 @@ app.get(
                 }
               }
               const storedMessage = await createPrivateMessage(
-                { id: sender.id, username: sender.username } satisfies ChatUser,
+                {
+                  id: sender.id,
+                  username: sender.username,
+                  avatarUrl: sender.avatarUrl,
+                  bio: sender.bio,
+                } satisfies ChatUser,
                 receiver.id,
                 message.message,
                 message.replyToMessageId,
