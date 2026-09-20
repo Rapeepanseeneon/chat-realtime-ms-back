@@ -118,6 +118,20 @@ export type User = {
 
 export type PublicUser = Omit<User, "passwordHash">;
 
+export type PresenceStatus = "online" | "away" | "dnd" | "invisible";
+export type MessageTextSize = "small" | "default" | "large";
+export type UserSettings = {
+  presenceStatus: PresenceStatus;
+  customStatus: string;
+  showOnlineStatus: boolean;
+  sendReadReceipts: boolean;
+  showTypingIndicator: boolean;
+  confirmGhostRelease: boolean;
+  enterToSend: boolean;
+  messageTextSize: MessageTextSize;
+  updatedAt: string;
+};
+
 type MessageRow = {
   id: string;
   name: string;
@@ -154,6 +168,10 @@ type UserRow = {
   avatarUrl: string | null;
   bio: string;
   createdAt: Date | string;
+  updatedAt: Date | string;
+};
+
+type UserSettingsRow = Omit<UserSettings, "updatedAt"> & {
   updatedAt: Date | string;
 };
 
@@ -254,6 +272,23 @@ export const initializeDatabase = async () => {
   await database`CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique_idx ON users (lower(email))`;
   await database`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`;
   await database`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio VARCHAR(150) NOT NULL DEFAULT ''`;
+  await database`
+    CREATE TABLE IF NOT EXISTS user_settings (
+      user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      presence_status VARCHAR(12) NOT NULL DEFAULT 'online',
+      custom_status VARCHAR(80) NOT NULL DEFAULT '',
+      show_online_status BOOLEAN NOT NULL DEFAULT TRUE,
+      send_read_receipts BOOLEAN NOT NULL DEFAULT TRUE,
+      show_typing_indicator BOOLEAN NOT NULL DEFAULT TRUE,
+      confirm_ghost_release BOOLEAN NOT NULL DEFAULT TRUE,
+      enter_to_send BOOLEAN NOT NULL DEFAULT TRUE,
+      message_text_size VARCHAR(10) NOT NULL DEFAULT 'default',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT user_settings_presence_valid CHECK (presence_status IN ('online', 'away', 'dnd', 'invisible')),
+      CONSTRAINT user_settings_text_size_valid CHECK (message_text_size IN ('small', 'default', 'large')),
+      CONSTRAINT user_settings_custom_status_valid CHECK (char_length(custom_status) <= 80)
+    )
+  `;
   await database`
     CREATE TABLE IF NOT EXISTS profile_links (
       id BIGSERIAL PRIMARY KEY,
@@ -720,6 +755,81 @@ export const setFavoriteFriend = async (
       WHERE user_id = ${userId} AND friend_id = ${friendId}
     `;
   return true;
+};
+
+const normalizeUserSettings = (row: UserSettingsRow): UserSettings => ({
+  ...row,
+  updatedAt: toIsoString(row.updatedAt),
+});
+
+const settingsSelect = (pool: SQL, userId: string) =>
+  pool<UserSettingsRow[]>`
+    SELECT presence_status AS "presenceStatus", custom_status AS "customStatus",
+      show_online_status AS "showOnlineStatus", send_read_receipts AS "sendReadReceipts",
+      show_typing_indicator AS "showTypingIndicator",
+      confirm_ghost_release AS "confirmGhostRelease", enter_to_send AS "enterToSend",
+      message_text_size AS "messageTextSize", updated_at AS "updatedAt"
+    FROM user_settings WHERE user_id = ${userId}
+  `;
+
+export const getUserSettings = async (
+  userId: string,
+  pool: SQL = database,
+): Promise<UserSettings> => {
+  await pool`
+    INSERT INTO user_settings (user_id) VALUES (${userId})
+    ON CONFLICT (user_id) DO NOTHING
+  `;
+  const [row] = await settingsSelect(pool, userId);
+  if (!row) throw new Error("User settings could not be loaded");
+  return normalizeUserSettings(row);
+};
+
+export const updateUserSettings = async (
+  userId: string,
+  settings: Omit<UserSettings, "updatedAt">,
+): Promise<UserSettings> => {
+  const [row] = await database<UserSettingsRow[]>`
+    INSERT INTO user_settings (
+      user_id, presence_status, custom_status, show_online_status,
+      send_read_receipts, show_typing_indicator, confirm_ghost_release,
+      enter_to_send, message_text_size, updated_at
+    ) VALUES (
+      ${userId}, ${settings.presenceStatus}, ${settings.customStatus},
+      ${settings.showOnlineStatus}, ${settings.sendReadReceipts},
+      ${settings.showTypingIndicator}, ${settings.confirmGhostRelease},
+      ${settings.enterToSend}, ${settings.messageTextSize}, NOW()
+    )
+    ON CONFLICT (user_id) DO UPDATE SET
+      presence_status = EXCLUDED.presence_status,
+      custom_status = EXCLUDED.custom_status,
+      show_online_status = EXCLUDED.show_online_status,
+      send_read_receipts = EXCLUDED.send_read_receipts,
+      show_typing_indicator = EXCLUDED.show_typing_indicator,
+      confirm_ghost_release = EXCLUDED.confirm_ghost_release,
+      enter_to_send = EXCLUDED.enter_to_send,
+      message_text_size = EXCLUDED.message_text_size,
+      updated_at = NOW()
+    RETURNING presence_status AS "presenceStatus", custom_status AS "customStatus",
+      show_online_status AS "showOnlineStatus", send_read_receipts AS "sendReadReceipts",
+      show_typing_indicator AS "showTypingIndicator",
+      confirm_ghost_release AS "confirmGhostRelease", enter_to_send AS "enterToSend",
+      message_text_size AS "messageTextSize", updated_at AS "updatedAt"
+  `;
+  if (!row) throw new Error("User settings could not be updated");
+  return normalizeUserSettings(row);
+};
+
+export const updateUserPassword = async (
+  userId: string,
+  passwordHash: string,
+) => {
+  const rows = await database`
+    UPDATE users SET password_hash = ${passwordHash}, updated_at = NOW()
+    WHERE id = ${userId}
+    RETURNING id
+  `;
+  return rows.length === 1;
 };
 
 export const createSession = async (

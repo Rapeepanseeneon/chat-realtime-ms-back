@@ -2,6 +2,7 @@ import type { WSContext } from "hono/ws";
 import {
   areFriends,
   getFriends,
+  getUserSettings,
   getUnreadCounts,
   markMessagesRead,
   type PublicUser,
@@ -17,6 +18,8 @@ export type StatusClientEvent =
 export type FriendStatus = {
   id: string;
   online: boolean;
+  status: "online" | "away" | "dnd" | "offline";
+  customStatus: string;
   presenceRevision: number;
   unreadCount: number;
 };
@@ -28,6 +31,8 @@ export type StatusServerEvent =
       type: "presence.update";
       userId: string;
       online: boolean;
+      status: "online" | "away" | "dnd" | "offline";
+      customStatus: string;
       revision: number;
     }
   | { type: "typing.start" | "typing.stop"; userId: string; receiverId: string }
@@ -72,15 +77,35 @@ export class ChatStatusTracker {
   }
 
   private async publishPresence(userId: string) {
-    const friends = await getFriends(userId);
+    const [friends, settings] = await Promise.all([
+      getFriends(userId),
+      getUserSettings(userId),
+    ]);
+    const publiclyOnline =
+      this.transport.isOnline(userId) &&
+      settings.showOnlineStatus &&
+      settings.presenceStatus !== "invisible";
     // Recheck after the query so a slow open notification cannot overwrite close.
     const event: StatusServerEvent = {
       type: "presence.update",
       userId,
-      online: this.transport.isOnline(userId),
+      online: publiclyOnline,
+      status:
+        publiclyOnline && settings.presenceStatus !== "invisible"
+          ? settings.presenceStatus
+          : "offline",
+      customStatus: publiclyOnline ? settings.customStatus : "",
       revision: this.presenceRevisions.get(userId) ?? 0,
     };
     for (const friend of friends) this.transport.sendToUser(friend.id, event);
+  }
+
+  settingsChanged(userId: string) {
+    this.presenceRevisions.set(
+      userId,
+      (this.presenceRevisions.get(userId) ?? 0) + 1,
+    );
+    return this.publishPresence(userId);
   }
 
   connected(user: PublicUser, client: WSContext, firstConnection: boolean) {
@@ -122,18 +147,38 @@ export class ChatStatusTracker {
       getFriends(userId),
       getUnreadCounts(userId),
     ]);
+    const friendSettings = new Map(
+      await Promise.all(
+        friends.map(async (friend) => [
+          friend.id,
+          await getUserSettings(friend.id),
+        ] as const),
+      ),
+    );
     const countByFriend = new Map(
       counts.map((count) => [count.friendId, count.unreadCount]),
     );
     this.transport.sendToClient(client, {
       type: "chat.state",
       unreadRevision,
-      friends: friends.map((friend) => ({
-        id: friend.id,
-        online: this.transport.isOnline(friend.id),
-        presenceRevision: this.presenceRevisions.get(friend.id) ?? 0,
-        unreadCount: countByFriend.get(friend.id) ?? 0,
-      })),
+      friends: friends.map((friend) => {
+        const settings = friendSettings.get(friend.id)!;
+        const publiclyOnline =
+          this.transport.isOnline(friend.id) &&
+          settings.showOnlineStatus &&
+          settings.presenceStatus !== "invisible";
+        return {
+          id: friend.id,
+          online: publiclyOnline,
+          status:
+            publiclyOnline && settings.presenceStatus !== "invisible"
+              ? settings.presenceStatus
+              : "offline",
+          customStatus: publiclyOnline ? settings.customStatus : "",
+          presenceRevision: this.presenceRevisions.get(friend.id) ?? 0,
+          unreadCount: countByFriend.get(friend.id) ?? 0,
+        };
+      }),
     });
   }
 
@@ -217,6 +262,7 @@ export class ChatStatusTracker {
       return;
     }
     if (event.type === "typing.start") {
+      if (!(await getUserSettings(user.id)).showTypingIndicator) return;
       if (
         [...this.transport.clientsFor(user.id)].some(
           (connection) =>
@@ -228,6 +274,7 @@ export class ChatStatusTracker {
     } else if (event.type === "typing.stop") {
       this.stopTyping(user.id, this.transport.keyFor(client), friendId);
     } else if (event.type === "message.read") {
+      const settings = await getUserSettings(user.id);
       const result = await markMessagesRead(
         user.id,
         friendId,
@@ -242,7 +289,7 @@ export class ChatStatusTracker {
         });
         return;
       }
-      if (result.readAt) {
+      if (result.readAt && settings.sendReadReceipts) {
         const receipt: StatusServerEvent = {
           type: "message.read",
           readerId: user.id,

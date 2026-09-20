@@ -39,6 +39,9 @@ import {
   getPublicProfile,
   setUserAvatar,
   setFavoriteFriend,
+  getUserSettings,
+  updateUserSettings,
+  updateUserPassword,
   createGroup,
   getGroups,
   getGroupInfo,
@@ -57,6 +60,9 @@ import {
   type PublicUser,
   type StoredMessage,
   type GroupMessage,
+  type PresenceStatus,
+  type MessageTextSize,
+  type UserSettings,
 } from "./database";
 import {
   ChatStatusTracker,
@@ -128,6 +134,7 @@ type ServerMessage =
       userId: string;
       username: string;
     }
+  | { type: "settings.updated"; settings: UserSettings }
   | StatusServerEvent;
 
 const app = new Hono<{ Variables: Variables }>();
@@ -655,6 +662,111 @@ app.post("/api/auth/logout", async (context) => {
   if (token) await deleteSession(hashSessionToken(token));
   deleteCookie(context, SESSION_COOKIE, { path: "/", secure: secureCookies });
   return context.json({ message: "Logged out successfully." });
+});
+
+app.get("/api/settings", requireAuth, async (context) => {
+  try {
+    return context.json({ settings: await getUserSettings(context.get("user").id) });
+  } catch (error) {
+    console.error("Failed to load settings", error);
+    return context.json({ error: "Settings could not be loaded." }, 500);
+  }
+});
+
+app.put("/api/settings", requireAuth, async (context) => {
+  const value = await readJson(context);
+  if (!value) return context.json({ error: "Please provide valid settings." }, 400);
+  const userId = context.get("user").id;
+  try {
+    const current = await getUserSettings(userId);
+    const presenceStatus = (value.presenceStatus ?? current.presenceStatus) as PresenceStatus;
+    const messageTextSize = (value.messageTextSize ?? current.messageTextSize) as MessageTextSize;
+    const customStatus =
+      value.customStatus === undefined
+        ? current.customStatus
+        : typeof value.customStatus === "string"
+          ? value.customStatus.trim()
+          : null;
+    const booleanKeys = [
+      "showOnlineStatus",
+      "sendReadReceipts",
+      "showTypingIndicator",
+      "confirmGhostRelease",
+      "enterToSend",
+    ] as const;
+    if (
+      !["online", "away", "dnd", "invisible"].includes(presenceStatus) ||
+      !["small", "default", "large"].includes(messageTextSize) ||
+      customStatus === null ||
+      customStatus.length > 80 ||
+      booleanKeys.some(
+        (key) => value[key] !== undefined && typeof value[key] !== "boolean",
+      )
+    ) {
+      return context.json({ error: "One or more settings are invalid." }, 400);
+    }
+    const settings = await updateUserSettings(userId, {
+      presenceStatus,
+      customStatus,
+      messageTextSize,
+      showOnlineStatus:
+        typeof value.showOnlineStatus === "boolean"
+          ? value.showOnlineStatus
+          : current.showOnlineStatus,
+      sendReadReceipts:
+        typeof value.sendReadReceipts === "boolean"
+          ? value.sendReadReceipts
+          : current.sendReadReceipts,
+      showTypingIndicator:
+        typeof value.showTypingIndicator === "boolean"
+          ? value.showTypingIndicator
+          : current.showTypingIndicator,
+      confirmGhostRelease:
+        typeof value.confirmGhostRelease === "boolean"
+          ? value.confirmGhostRelease
+          : current.confirmGhostRelease,
+      enterToSend:
+        typeof value.enterToSend === "boolean"
+          ? value.enterToSend
+          : current.enterToSend,
+    });
+    await chatStatus.settingsChanged(userId);
+    sendToUser(userId, { type: "settings.updated", settings });
+    return context.json({ settings, message: "Settings updated." });
+  } catch (error) {
+    console.error("Failed to update settings", error);
+    return context.json({ error: "Settings could not be updated." }, 500);
+  }
+});
+
+app.put("/api/settings/password", requireAuth, async (context) => {
+  const value = await readJson(context);
+  const currentPassword =
+    typeof value?.currentPassword === "string" ? value.currentPassword : "";
+  const newPassword =
+    typeof value?.newPassword === "string" ? value.newPassword : "";
+  const confirmPassword =
+    typeof value?.confirmPassword === "string" ? value.confirmPassword : "";
+  if (!currentPassword)
+    return context.json({ error: "Current password is required." }, 400);
+  if (
+    newPassword.length < MIN_PASSWORD_LENGTH ||
+    newPassword.length > MAX_PASSWORD_LENGTH
+  )
+    return context.json(
+      { error: `New password must be ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_LENGTH} characters.` },
+      400,
+    );
+  if (newPassword !== confirmPassword)
+    return context.json({ error: "New passwords do not match." }, 400);
+  const publicUser = context.get("user");
+  const user = await findUserByEmail(publicUser.email);
+  if (!user || !(await Bun.password.verify(currentPassword, user.passwordHash)))
+    return context.json({ error: "Current password is incorrect." }, 401);
+  const passwordHash = await Bun.password.hash(newPassword, "argon2id");
+  if (!(await updateUserPassword(user.id, passwordHash)))
+    return context.json({ error: "Password could not be changed." }, 500);
+  return context.json({ message: "Password changed successfully." });
 });
 
 app.get("/api/profile", requireAuth, async (context) => {
@@ -1206,6 +1318,8 @@ app.get(
               if (message.type === "group.typing.stop")
                 await stopGroupTyping(client, sender, message.groupId);
               else {
+                if (!(await getUserSettings(sender.id)).showTypingIndicator)
+                  return;
                 const key = getClientKey(client),
                   groups = groupTyping.get(key) ?? new Map();
                 const existing = groups.get(message.groupId);
