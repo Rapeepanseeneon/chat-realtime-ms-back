@@ -11,6 +11,7 @@ import {
   createFriendRequest,
   createMessage,
   createPrivateMessage,
+  createPrivateAttachmentMessage,
   findPrivateMessage,
   mutatePrivateMessage,
   updateGhost,
@@ -48,6 +49,7 @@ import {
   getGroupMessages,
   getGroupMemberIds,
   createGroupMessage,
+  createGroupAttachmentMessage,
   mutateGroupMessage,
   markGroupRead,
   isGroupMember,
@@ -55,6 +57,7 @@ import {
   addGroupMember,
   removeGroupMember,
   leaveGroup,
+  getAccessibleAttachment,
   type ChatUser,
   type PrivateMessage,
   type PublicUser,
@@ -63,6 +66,7 @@ import {
   type PresenceStatus,
   type MessageTextSize,
   type UserSettings,
+  type NewAttachment,
 } from "./database";
 import {
   ChatStatusTracker,
@@ -70,6 +74,13 @@ import {
   type StatusServerEvent,
 } from "./chat-status";
 import { startGhostScheduler } from "./ghost-scheduler";
+import {
+  attachmentFile,
+  MAX_FILE_BYTES,
+  removeAttachment,
+  validateUpload,
+  writeAttachment,
+} from "./attachment-storage";
 
 const MAX_MESSAGE_LENGTH = 1_000;
 const MIN_PASSWORD_LENGTH = 8;
@@ -523,6 +534,49 @@ const publishReleasedGhost = async (
   sendToUser(message.senderId, { type: "message.new", message });
   sendToUser(message.receiverId, { type: "message.new", message });
   await chatStatus.publishUnread(message.receiverId, transaction);
+};
+
+const isDatabaseId = (value: unknown): value is string =>
+  typeof value === "string" &&
+  /^[1-9]\d{0,18}$/.test(value) &&
+  BigInt(value) <= 9_223_372_036_854_775_807n;
+
+const saveAttachmentMessage = async (
+  user: PublicUser,
+  scope: "private" | "group",
+  targetId: string,
+  attachment: NewAttachment,
+  caption: string,
+) => {
+  if (scope === "private") {
+    const message = await createPrivateAttachmentMessage(
+      {
+        id: user.id,
+        username: user.username,
+        avatarUrl: user.avatarUrl,
+        bio: user.bio,
+      },
+      targetId,
+      attachment,
+      caption,
+    );
+    if (!message) return null;
+    sendToUser(message.senderId, { type: "message.new", message });
+    sendToUser(message.receiverId, { type: "message.new", message });
+    await chatStatus.publishUnread(message.receiverId);
+    return { scope, message } as const;
+  }
+  const message = await createGroupAttachmentMessage(
+    targetId,
+    user.id,
+    attachment,
+    caption,
+  );
+  if (!message) return null;
+  await broadcastToGroup(targetId, { type: "group.message.new", message });
+  for (const memberId of await getGroupMemberIds(targetId))
+    sendToUser(memberId, { type: "group.updated", groupId: targetId });
+  return { scope, message } as const;
 };
 
 app.use(
@@ -1262,6 +1316,141 @@ app.get("/api/messages", requireAuth, async (context) => {
     return context.json({ error: "Failed to load message history" }, 500);
   }
 });
+
+app.post("/api/attachments", requireAuth, async (context) => {
+  const contentLength = Number(context.req.header("Content-Length") ?? 0);
+  if (contentLength > MAX_FILE_BYTES + 1024 * 1024)
+    return context.json({ error: "Upload is too large." }, 413);
+  let storageKey: string | null = null;
+  try {
+    const form = await context.req.formData();
+    const file = form.get("file");
+    const kind = form.get("kind");
+    const scope = form.get("scope");
+    const targetId = form.get("targetId");
+    const rawCaption = form.get("caption");
+    const caption = typeof rawCaption === "string" ? rawCaption.trim() : "";
+    if (
+      !(file instanceof File) ||
+      (scope !== "private" && scope !== "group") ||
+      !isDatabaseId(targetId) ||
+      caption.length > MAX_MESSAGE_LENGTH
+    )
+      return context.json({ error: "Invalid attachment request." }, 400);
+    const validated = await validateUpload(
+      file,
+      typeof kind === "string" ? kind : "",
+    );
+    if ("error" in validated)
+      return context.json({ error: validated.error }, 400);
+    storageKey = await writeAttachment(validated);
+    const result = await saveAttachmentMessage(
+      context.get("user"),
+      scope,
+      targetId,
+      {
+        kind: validated.kind,
+        storageKey,
+        fileName: validated.originalName,
+        mimeType: validated.mimeType,
+        sizeBytes: validated.sizeBytes,
+      },
+      caption,
+    );
+    if (!result) {
+      await removeAttachment(storageKey);
+      return context.json(
+        {
+          error:
+            scope === "private"
+              ? "You can only share with accepted friends."
+              : "You are not a member of this group.",
+        },
+        403,
+      );
+    }
+    return context.json(result, 201);
+  } catch (error) {
+    if (storageKey) await removeAttachment(storageKey);
+    console.error("Failed to upload chat attachment", error);
+    return context.json({ error: "Attachment could not be sent." }, 500);
+  }
+});
+
+app.post("/api/attachments/location", requireAuth, async (context) => {
+  const value = await readJson(context);
+  const scope = value?.scope;
+  const targetId = value?.targetId;
+  const latitude = value?.latitude;
+  const longitude = value?.longitude;
+  const caption =
+    typeof value?.caption === "string" ? value.caption.trim() : "";
+  if (
+    (scope !== "private" && scope !== "group") ||
+    !isDatabaseId(targetId) ||
+    typeof latitude !== "number" ||
+    !Number.isFinite(latitude) ||
+    latitude < -90 ||
+    latitude > 90 ||
+    typeof longitude !== "number" ||
+    !Number.isFinite(longitude) ||
+    longitude < -180 ||
+    longitude > 180 ||
+    caption.length > MAX_MESSAGE_LENGTH
+  )
+    return context.json({ error: "Invalid location request." }, 400);
+  try {
+    const result = await saveAttachmentMessage(
+      context.get("user"),
+      scope,
+      targetId,
+      { kind: "location", latitude, longitude },
+      caption,
+    );
+    return result
+      ? context.json(result, 201)
+      : context.json(
+          {
+            error:
+              scope === "private"
+                ? "You can only share with accepted friends."
+                : "You are not a member of this group.",
+          },
+          403,
+        );
+  } catch (error) {
+    console.error("Failed to share location", error);
+    return context.json({ error: "Location could not be sent." }, 500);
+  }
+});
+
+app.get(
+  "/api/attachments/:attachmentId/content",
+  requireAuth,
+  async (context) => {
+    const id = context.req.param("attachmentId");
+    if (!isDatabaseId(id)) return context.notFound();
+    const attachment = await getAccessibleAttachment(
+      id,
+      context.get("user").id,
+    );
+    if (!attachment?.storageKey || !attachment.mimeType)
+      return context.notFound();
+    const file = attachmentFile(attachment.storageKey);
+    if (!(await file.exists())) return context.notFound();
+    const disposition = attachment.kind === "image" ? "inline" : "attachment";
+    const encodedName = encodeURIComponent(attachment.fileName ?? "attachment");
+    return new Response(file, {
+      headers: {
+        "Content-Type": attachment.mimeType,
+        "Content-Disposition": `${disposition}; filename*=UTF-8''${encodedName}`,
+        "Cache-Control": "private, max-age=3600",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+      },
+    });
+  },
+);
 
 app.use("/ws", requireAuth);
 app.get(

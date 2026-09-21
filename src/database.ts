@@ -40,6 +40,27 @@ export type CreateFriendRequestResult =
   | { outcome: "pending" }
   | { outcome: "friends" };
 
+export type MessageAttachment = {
+  id: string;
+  kind: "image" | "file" | "location";
+  fileName: string | null;
+  mimeType: string | null;
+  sizeBytes: number | null;
+  contentUrl: string | null;
+  latitude: number | null;
+  longitude: number | null;
+};
+
+export type NewAttachment =
+  | {
+      kind: "image" | "file";
+      storageKey: string;
+      fileName: string;
+      mimeType: string;
+      sizeBytes: number;
+    }
+  | { kind: "location"; latitude: number; longitude: number };
+
 export type PrivateMessage = {
   id: string;
   senderId: string;
@@ -55,6 +76,7 @@ export type PrivateMessage = {
   editedAt: string | null;
   deletedAt: string | null;
   replyToMessageId: string | null;
+  attachment: MessageAttachment | null;
   reply: {
     id: string;
     senderId: string;
@@ -95,6 +117,7 @@ export type GroupMessage = {
   editedAt: string | null;
   deletedAt: string | null;
   replyToMessageId: string | null;
+  attachment: MessageAttachment | null;
   reply: {
     id: string;
     senderId: string;
@@ -158,6 +181,13 @@ type PrivateMessageRow = {
   replyText: string | null;
   replyEditedAt: Date | string | null;
   replyDeletedAt: Date | string | null;
+  attachmentId: string | null;
+  attachmentKind: MessageAttachment["kind"] | null;
+  attachmentFileName: string | null;
+  attachmentMimeType: string | null;
+  attachmentSizeBytes: string | number | null;
+  attachmentLatitude: string | number | null;
+  attachmentLongitude: string | number | null;
 };
 
 type UserRow = {
@@ -210,6 +240,40 @@ const normalizeMessage = (row: MessageRow): StoredMessage => ({
   createdAt: toIsoString(row.createdAt),
 });
 
+const normalizeAttachment = (row: {
+  attachmentId: string | null;
+  attachmentKind: MessageAttachment["kind"] | null;
+  attachmentFileName: string | null;
+  attachmentMimeType: string | null;
+  attachmentSizeBytes: string | number | null;
+  attachmentLatitude: string | number | null;
+  attachmentLongitude: string | number | null;
+}): MessageAttachment | null =>
+  row.attachmentId && row.attachmentKind
+    ? {
+        id: row.attachmentId,
+        kind: row.attachmentKind,
+        fileName: row.attachmentFileName,
+        mimeType: row.attachmentMimeType,
+        sizeBytes:
+          row.attachmentSizeBytes == null
+            ? null
+            : Number(row.attachmentSizeBytes),
+        contentUrl:
+          row.attachmentKind === "location"
+            ? null
+            : `/api/attachments/${row.attachmentId}/content`,
+        latitude:
+          row.attachmentLatitude == null
+            ? null
+            : Number(row.attachmentLatitude),
+        longitude:
+          row.attachmentLongitude == null
+            ? null
+            : Number(row.attachmentLongitude),
+      }
+    : null;
+
 const normalizePrivateMessage = (row: PrivateMessageRow): PrivateMessage => ({
   id: row.id,
   senderId: row.senderId,
@@ -225,6 +289,7 @@ const normalizePrivateMessage = (row: PrivateMessageRow): PrivateMessage => ({
   editedAt: row.editedAt ? toIsoString(row.editedAt) : null,
   deletedAt: row.deletedAt ? toIsoString(row.deletedAt) : null,
   replyToMessageId: row.replyToMessageId,
+  attachment: normalizeAttachment(row),
   reply:
     row.replyToMessageId && row.replySenderId
       ? {
@@ -345,6 +410,30 @@ export const initializeDatabase = async () => {
   await database`CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions (user_id)`;
   await database`CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions (expires_at)`;
   await database`
+    CREATE TABLE IF NOT EXISTS chat_attachments (
+      id BIGSERIAL PRIMARY KEY,
+      owner_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      kind VARCHAR(10) NOT NULL,
+      storage_key VARCHAR(80) UNIQUE,
+      original_name VARCHAR(180),
+      mime_type VARCHAR(100),
+      size_bytes BIGINT,
+      latitude DOUBLE PRECISION,
+      longitude DOUBLE PRECISION,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT chat_attachments_kind_valid CHECK (kind IN ('image','file','location')),
+      CONSTRAINT chat_attachments_payload_valid CHECK (
+        (kind IN ('image','file') AND storage_key IS NOT NULL AND original_name IS NOT NULL
+          AND mime_type IS NOT NULL AND size_bytes > 0 AND latitude IS NULL AND longitude IS NULL)
+        OR
+        (kind = 'location' AND storage_key IS NULL AND original_name IS NULL
+          AND mime_type IS NULL AND size_bytes IS NULL
+          AND latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180)
+      )
+    )
+  `;
+  await database`CREATE INDEX IF NOT EXISTS chat_attachments_owner_idx ON chat_attachments(owner_id, id DESC)`;
+  await database`
     CREATE TABLE IF NOT EXISTS messages (
       id BIGSERIAL PRIMARY KEY,
       sender_name VARCHAR(50) NOT NULL,
@@ -372,6 +461,8 @@ export const initializeDatabase = async () => {
   await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS state_updated_at TIMESTAMPTZ`;
   await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_id BIGINT`;
   await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS ghost_publish_pending BOOLEAN NOT NULL DEFAULT FALSE`;
+  await database`ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_id BIGINT REFERENCES chat_attachments(id) ON DELETE SET NULL`;
+  await database`CREATE UNIQUE INDEX IF NOT EXISTS messages_attachment_unique_idx ON messages(attachment_id) WHERE attachment_id IS NOT NULL`;
   await database`CREATE INDEX IF NOT EXISTS messages_pending_ghost_publish_idx ON messages (id) WHERE ghost_publish_pending = TRUE`;
   await database.begin(async (transaction) => {
     await transaction`ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_status_valid`;
@@ -385,7 +476,7 @@ export const initializeDatabase = async () => {
   // Preserve the legacy nonblank rule; only tombstones may have erased content.
   await database.begin(async (transaction) => {
     await transaction`ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_message_text_not_blank`;
-    await transaction`ALTER TABLE messages ADD CONSTRAINT messages_message_text_not_blank CHECK (deleted_at IS NOT NULL OR char_length(btrim(message_text)) BETWEEN 1 AND 1000)`;
+    await transaction`ALTER TABLE messages ADD CONSTRAINT messages_message_text_not_blank CHECK (deleted_at IS NOT NULL OR attachment_id IS NOT NULL OR char_length(btrim(message_text)) BETWEEN 1 AND 1000)`;
   });
   await database`
     CREATE INDEX IF NOT EXISTS messages_unread_receiver_sender_idx
@@ -420,6 +511,12 @@ export const initializeDatabase = async () => {
     reply_to_message_id BIGINT REFERENCES group_messages(id) ON DELETE SET NULL,
     CONSTRAINT group_messages_text_valid CHECK (deleted_at IS NOT NULL OR char_length(btrim(message_text)) BETWEEN 1 AND 1000)
   )`;
+  await database`ALTER TABLE group_messages ADD COLUMN IF NOT EXISTS attachment_id BIGINT REFERENCES chat_attachments(id) ON DELETE SET NULL`;
+  await database`CREATE UNIQUE INDEX IF NOT EXISTS group_messages_attachment_unique_idx ON group_messages(attachment_id) WHERE attachment_id IS NOT NULL`;
+  await database.begin(async (transaction) => {
+    await transaction`ALTER TABLE group_messages DROP CONSTRAINT IF EXISTS group_messages_text_valid`;
+    await transaction`ALTER TABLE group_messages ADD CONSTRAINT group_messages_text_valid CHECK (deleted_at IS NOT NULL OR attachment_id IS NOT NULL OR char_length(btrim(message_text)) BETWEEN 1 AND 1000)`;
+  });
   await database`CREATE INDEX IF NOT EXISTS group_messages_history_idx ON group_messages(group_id, id DESC)`;
   await database`CREATE TABLE IF NOT EXISTS group_reads (
     group_id BIGINT NOT NULL, user_id BIGINT NOT NULL, last_read_message_id BIGINT,
@@ -914,13 +1011,21 @@ const selectPrivateMessages = async (
       m.edited_at AS "editedAt", m.deleted_at AS "deletedAt",
       m.reply_to_message_id::text AS "replyToMessageId",
       original.sender_id::text AS "replySenderId",
-      CASE WHEN original.deleted_at IS NULL THEN original.message_text ELSE '' END AS "replyText",
-      original.edited_at AS "replyEditedAt", original.deleted_at AS "replyDeletedAt"
+      CASE WHEN original.deleted_at IS NULL THEN
+        CASE WHEN original.attachment_id IS NOT NULL AND btrim(original.message_text) = '' THEN '[Attachment]'
+          ELSE original.message_text END
+        ELSE '' END AS "replyText",
+      original.edited_at AS "replyEditedAt", original.deleted_at AS "replyDeletedAt",
+      attachment.id::text AS "attachmentId", attachment.kind AS "attachmentKind",
+      attachment.original_name AS "attachmentFileName", attachment.mime_type AS "attachmentMimeType",
+      attachment.size_bytes AS "attachmentSizeBytes", attachment.latitude AS "attachmentLatitude",
+      attachment.longitude AS "attachmentLongitude"
     FROM messages m
     LEFT JOIN messages original ON original.id = m.reply_to_message_id
       AND original.message_status = 'sent'
       AND ((original.sender_id = m.sender_id AND original.receiver_id = m.receiver_id)
         OR (original.sender_id = m.receiver_id AND original.receiver_id = m.sender_id))
+    LEFT JOIN chat_attachments attachment ON attachment.id = m.attachment_id
     WHERE m.id IN ${pool(ids)} AND m.receiver_id IS NOT NULL AND m.sender_id IS NOT NULL
       AND (${viewerId}::bigint IS NULL OR m.message_status = 'sent' OR m.sender_id = ${viewerId}::bigint)
     ORDER BY COALESCE(m.released_at, m.created_at) ASC, m.id ASC
@@ -932,6 +1037,109 @@ export const findPrivateMessage = async (
   messageId: string,
 ): Promise<PrivateMessage | null> =>
   (await selectPrivateMessages([messageId]))[0] ?? null;
+
+const insertAttachment = async (
+  pool: SQL,
+  ownerId: string,
+  attachment: NewAttachment,
+) => {
+  const file = attachment.kind === "location" ? null : attachment;
+  const location = attachment.kind === "location" ? attachment : null;
+  const [row] = await pool<{ id: string }[]>`
+    INSERT INTO chat_attachments(
+      owner_id, kind, storage_key, original_name, mime_type, size_bytes, latitude, longitude
+    ) VALUES (
+      ${ownerId}, ${attachment.kind}, ${file?.storageKey ?? null},
+      ${file?.fileName ?? null}, ${file?.mimeType ?? null}, ${file?.sizeBytes ?? null},
+      ${location?.latitude ?? null}, ${location?.longitude ?? null}
+    ) RETURNING id::text AS id
+  `;
+  if (!row) throw new Error("Attachment could not be saved.");
+  return row.id;
+};
+
+export const createPrivateAttachmentMessage = async (
+  sender: ChatUser,
+  receiverId: string,
+  attachment: NewAttachment,
+  caption: string,
+): Promise<PrivateMessage | null> =>
+  database.begin(async (transaction) => {
+    const [permission] = await transaction<{ ok: boolean }[]>`
+      SELECT EXISTS(
+        SELECT 1 FROM friend_requests WHERE status='accepted'
+          AND LEAST(sender_id,receiver_id)=LEAST(${sender.id}::bigint,${receiverId}::bigint)
+          AND GREATEST(sender_id,receiver_id)=GREATEST(${sender.id}::bigint,${receiverId}::bigint)
+      ) AS ok
+    `;
+    if (!permission?.ok || sender.id === receiverId) return null;
+    const attachmentId = await insertAttachment(
+      transaction,
+      sender.id,
+      attachment,
+    );
+    const [message] = await transaction<{ id: string }[]>`
+      INSERT INTO messages(
+        sender_name,sender_id,receiver_id,message_text,message_status,state_updated_at,attachment_id
+      ) VALUES (
+        ${sender.username},${sender.id},${receiverId},${caption},'sent',clock_timestamp(),${attachmentId}
+      ) RETURNING id::text AS id
+    `;
+    return message
+      ? ((await selectPrivateMessages([message.id], null, transaction))[0] ??
+          null)
+      : null;
+  });
+
+export type AccessibleAttachment = MessageAttachment & {
+  storageKey: string | null;
+};
+
+export const getAccessibleAttachment = async (
+  attachmentId: string,
+  userId: string,
+): Promise<AccessibleAttachment | null> => {
+  const [row] = await database<
+    {
+      attachmentId: string;
+      attachmentKind: MessageAttachment["kind"];
+      attachmentFileName: string | null;
+      attachmentMimeType: string | null;
+      attachmentSizeBytes: string | number | null;
+      attachmentLatitude: string | number | null;
+      attachmentLongitude: string | number | null;
+      storageKey: string | null;
+    }[]
+  >`
+    SELECT attachment.id::text AS "attachmentId", attachment.kind AS "attachmentKind",
+      attachment.original_name AS "attachmentFileName", attachment.mime_type AS "attachmentMimeType",
+      attachment.size_bytes AS "attachmentSizeBytes", attachment.latitude AS "attachmentLatitude",
+      attachment.longitude AS "attachmentLongitude", attachment.storage_key AS "storageKey"
+    FROM chat_attachments attachment
+    WHERE attachment.id=${attachmentId}
+      AND (
+        EXISTS(
+          SELECT 1 FROM messages message
+          WHERE message.attachment_id=attachment.id AND message.deleted_at IS NULL
+            AND message.message_status='sent'
+            AND ${userId}::bigint IN (message.sender_id,message.receiver_id)
+            AND EXISTS(SELECT 1 FROM friend_requests friendship WHERE friendship.status='accepted'
+              AND LEAST(friendship.sender_id,friendship.receiver_id)=LEAST(message.sender_id,message.receiver_id)
+              AND GREATEST(friendship.sender_id,friendship.receiver_id)=GREATEST(message.sender_id,message.receiver_id))
+        )
+        OR EXISTS(
+          SELECT 1 FROM group_messages message
+          JOIN group_members member ON member.group_id=message.group_id AND member.user_id=${userId}
+          WHERE message.attachment_id=attachment.id AND message.deleted_at IS NULL
+        )
+      )
+    LIMIT 1
+  `;
+  const normalized = row ? normalizeAttachment(row) : null;
+  return normalized && row
+    ? { ...normalized, storageKey: row.storageKey }
+    : null;
+};
 
 export type GhostAction =
   | { action: "edit"; text: string }
@@ -1164,7 +1372,7 @@ type GroupSummaryRow = Omit<GroupSummary, "createdAt" | "updatedAt"> & {
 };
 type GroupMessageRow = Omit<
   GroupMessage,
-  "createdAt" | "editedAt" | "deletedAt" | "reply"
+  "createdAt" | "editedAt" | "deletedAt" | "reply" | "attachment"
 > & {
   createdAt: Date | string;
   editedAt: Date | string | null;
@@ -1174,6 +1382,13 @@ type GroupMessageRow = Omit<
   replyText: string | null;
   replyEditedAt: Date | string | null;
   replyDeletedAt: Date | string | null;
+  attachmentId: string | null;
+  attachmentKind: MessageAttachment["kind"] | null;
+  attachmentFileName: string | null;
+  attachmentMimeType: string | null;
+  attachmentSizeBytes: string | number | null;
+  attachmentLatitude: string | number | null;
+  attachmentLongitude: string | number | null;
 };
 const normalizeGroupSummary = (row: GroupSummaryRow): GroupSummary => ({
   ...row,
@@ -1191,6 +1406,7 @@ const normalizeGroupMessage = (row: GroupMessageRow): GroupMessage => ({
   editedAt: row.editedAt ? toIsoString(row.editedAt) : null,
   deletedAt: row.deletedAt ? toIsoString(row.deletedAt) : null,
   replyToMessageId: row.replyToMessageId,
+  attachment: normalizeAttachment(row),
   reply:
     row.replyToMessageId && row.replySenderId
       ? {
@@ -1288,9 +1504,15 @@ const selectGroupMessages = async (ids: string[]): Promise<GroupMessage[]> => {
     SELECT m.id::text id,m.group_id::text AS "groupId",m.sender_id::text AS "senderId",u.username AS "senderUsername",u.avatar_url AS "senderAvatarUrl",
       m.message_text AS "messageText",m.created_at AS "createdAt",m.edited_at AS "editedAt",m.deleted_at AS "deletedAt",
       m.reply_to_message_id::text AS "replyToMessageId",r.sender_id::text AS "replySenderId",ru.username AS "replySenderUsername",
-      r.message_text AS "replyText",r.edited_at AS "replyEditedAt",r.deleted_at AS "replyDeletedAt"
+      CASE WHEN r.attachment_id IS NOT NULL AND btrim(r.message_text)='' THEN '[Attachment]' ELSE r.message_text END AS "replyText",
+      r.edited_at AS "replyEditedAt",r.deleted_at AS "replyDeletedAt",
+      attachment.id::text AS "attachmentId",attachment.kind AS "attachmentKind",
+      attachment.original_name AS "attachmentFileName",attachment.mime_type AS "attachmentMimeType",
+      attachment.size_bytes AS "attachmentSizeBytes",attachment.latitude AS "attachmentLatitude",
+      attachment.longitude AS "attachmentLongitude"
     FROM group_messages m JOIN users u ON u.id=m.sender_id
     LEFT JOIN group_messages r ON r.id=m.reply_to_message_id AND r.group_id=m.group_id LEFT JOIN users ru ON ru.id=r.sender_id
+    LEFT JOIN chat_attachments attachment ON attachment.id=m.attachment_id
     WHERE m.id IN ${database(ids)} ORDER BY m.id`;
   return rows.map(normalizeGroupMessage);
 };
@@ -1321,6 +1543,49 @@ export const createGroupMessage = async (
   await database`UPDATE groups SET updated_at=clock_timestamp() WHERE id=${groupId}`;
   return (await selectGroupMessages([row.id]))[0] ?? null;
 };
+
+export const createGroupAttachmentMessage = async (
+  groupId: string,
+  senderId: string,
+  attachment: NewAttachment,
+  caption: string,
+): Promise<GroupMessage | null> =>
+  database.begin(async (transaction) => {
+    const [membership] = await transaction<{ ok: boolean }[]>`
+      SELECT EXISTS(
+        SELECT 1 FROM group_members WHERE group_id=${groupId} AND user_id=${senderId}
+      ) AS ok
+    `;
+    if (!membership?.ok) return null;
+    const attachmentId = await insertAttachment(
+      transaction,
+      senderId,
+      attachment,
+    );
+    const [message] = await transaction<{ id: string }[]>`
+      INSERT INTO group_messages(group_id,sender_id,message_text,attachment_id)
+      VALUES(${groupId},${senderId},${caption},${attachmentId})
+      RETURNING id::text AS id
+    `;
+    await transaction`UPDATE groups SET updated_at=clock_timestamp() WHERE id=${groupId}`;
+    if (!message) return null;
+    const rows = await transaction<GroupMessageRow[]>`
+      SELECT m.id::text id,m.group_id::text AS "groupId",m.sender_id::text AS "senderId",
+        u.username AS "senderUsername",u.avatar_url AS "senderAvatarUrl",
+        m.message_text AS "messageText",m.created_at AS "createdAt",m.edited_at AS "editedAt",
+        m.deleted_at AS "deletedAt",m.reply_to_message_id::text AS "replyToMessageId",
+        NULL::text AS "replySenderId",NULL::text AS "replySenderUsername",NULL::text AS "replyText",
+        NULL::timestamptz AS "replyEditedAt",NULL::timestamptz AS "replyDeletedAt",
+        stored.id::text AS "attachmentId",stored.kind AS "attachmentKind",
+        stored.original_name AS "attachmentFileName",stored.mime_type AS "attachmentMimeType",
+        stored.size_bytes AS "attachmentSizeBytes",stored.latitude AS "attachmentLatitude",
+        stored.longitude AS "attachmentLongitude"
+      FROM group_messages m JOIN users u ON u.id=m.sender_id
+      LEFT JOIN chat_attachments stored ON stored.id=m.attachment_id
+      WHERE m.id=${message.id}
+    `;
+    return rows[0] ? normalizeGroupMessage(rows[0]) : null;
+  });
 
 export const mutateGroupMessage = async (
   id: string,
