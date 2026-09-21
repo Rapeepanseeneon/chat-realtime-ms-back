@@ -149,10 +149,10 @@ export class ChatStatusTracker {
     ]);
     const friendSettings = new Map(
       await Promise.all(
-        friends.map(async (friend) => [
-          friend.id,
-          await getUserSettings(friend.id),
-        ] as const),
+        friends.map(
+          async (friend) =>
+            [friend.id, await getUserSettings(friend.id)] as const,
+        ),
       ),
     );
     const countByFriend = new Map(

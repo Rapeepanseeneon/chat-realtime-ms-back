@@ -666,7 +666,9 @@ app.post("/api/auth/logout", async (context) => {
 
 app.get("/api/settings", requireAuth, async (context) => {
   try {
-    return context.json({ settings: await getUserSettings(context.get("user").id) });
+    return context.json({
+      settings: await getUserSettings(context.get("user").id),
+    });
   } catch (error) {
     console.error("Failed to load settings", error);
     return context.json({ error: "Settings could not be loaded." }, 500);
@@ -675,12 +677,30 @@ app.get("/api/settings", requireAuth, async (context) => {
 
 app.put("/api/settings", requireAuth, async (context) => {
   const value = await readJson(context);
-  if (!value) return context.json({ error: "Please provide valid settings." }, 400);
+  if (!value)
+    return context.json({ error: "Please provide valid settings." }, 400);
+  const allowedKeys = new Set([
+    "presenceStatus",
+    "customStatus",
+    "showOnlineStatus",
+    "sendReadReceipts",
+    "showTypingIndicator",
+    "confirmGhostRelease",
+    "enterToSend",
+    "messageTextSize",
+  ]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key)))
+    return context.json(
+      { error: "One or more settings are not supported." },
+      400,
+    );
   const userId = context.get("user").id;
   try {
     const current = await getUserSettings(userId);
-    const presenceStatus = (value.presenceStatus ?? current.presenceStatus) as PresenceStatus;
-    const messageTextSize = (value.messageTextSize ?? current.messageTextSize) as MessageTextSize;
+    const presenceStatus = (value.presenceStatus ??
+      current.presenceStatus) as PresenceStatus;
+    const messageTextSize = (value.messageTextSize ??
+      current.messageTextSize) as MessageTextSize;
     const customStatus =
       value.customStatus === undefined
         ? current.customStatus
@@ -754,7 +774,9 @@ app.put("/api/settings/password", requireAuth, async (context) => {
     newPassword.length > MAX_PASSWORD_LENGTH
   )
     return context.json(
-      { error: `New password must be ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_LENGTH} characters.` },
+      {
+        error: `New password must be ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_LENGTH} characters.`,
+      },
       400,
     );
   if (newPassword !== confirmPassword)
@@ -923,12 +945,27 @@ app.get("/api/friends", requireAuth, async (context) => {
     const unread = new Map(
       counts.map((count) => [count.friendId, count.unreadCount]),
     );
+    const visibleFriends = await Promise.all(
+      friends.map(async (friend) => {
+        const settings = await getUserSettings(friend.id);
+        const online =
+          (connectionsByUser.get(friend.id)?.size ?? 0) > 0 &&
+          settings.showOnlineStatus &&
+          settings.presenceStatus !== "invisible";
+        return {
+          ...friend,
+          unreadCount: unread.get(friend.id) ?? 0,
+          online,
+          status:
+            online && settings.presenceStatus !== "invisible"
+              ? settings.presenceStatus
+              : "offline",
+          customStatus: online ? settings.customStatus : "",
+        };
+      }),
+    );
     return context.json({
-      friends: friends.map((friend) => ({
-        ...friend,
-        unreadCount: unread.get(friend.id) ?? 0,
-        online: (connectionsByUser.get(friend.id)?.size ?? 0) > 0,
-      })),
+      friends: visibleFriends,
     });
   } catch (error) {
     console.error("Failed to load friends", error);
