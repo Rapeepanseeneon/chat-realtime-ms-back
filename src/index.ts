@@ -102,6 +102,26 @@ const secureCookies =
   (Bun.env.COOKIE_SECURE !== "false" && Bun.env.NODE_ENV === "production");
 
 type Variables = { user: PublicUser };
+type CallIceCandidate = {
+  candidate: string;
+  sdpMid: string | null;
+  sdpMLineIndex: number | null;
+  usernameFragment: string | null;
+};
+type CallClientMessage =
+  | {
+      type: "call.offer";
+      callId: string;
+      calleeId: string;
+      sdp: string;
+    }
+  | { type: "call.answer"; callId: string; sdp: string }
+  | {
+      type: "call.ice_candidate";
+      callId: string;
+      candidate: CallIceCandidate;
+    }
+  | { type: "call.reject" | "call.end"; callId: string };
 type ClientMessage =
   | {
       type: "message.send" | "ghost.create";
@@ -127,6 +147,7 @@ type ClientMessage =
   | { type: "group.read"; groupId: string }
   | { type: "group.typing.start"; groupId: string }
   | { type: "group.typing.stop"; groupId: string }
+  | CallClientMessage
   | StatusClientEvent;
 type ServerMessage =
   | { type: "message.new"; message: PrivateMessage }
@@ -146,6 +167,36 @@ type ServerMessage =
       username: string;
     }
   | { type: "settings.updated"; settings: UserSettings }
+  | {
+      type: "call.offer";
+      callId: string;
+      caller: Pick<PublicUser, "id" | "username" | "avatarUrl">;
+      sdp: string;
+    }
+  | {
+      type: "call.answer";
+      callId: string;
+      fromUserId: string;
+      sdp: string;
+    }
+  | {
+      type: "call.ice_candidate";
+      callId: string;
+      fromUserId: string;
+      candidate: CallIceCandidate;
+    }
+  | {
+      type: "call.reject" | "call.end";
+      callId: string;
+      fromUserId: string;
+      reason?: string;
+    }
+  | {
+      type: "call.unavailable";
+      callId: string;
+      calleeId: string;
+      reason: "offline" | "busy" | "not_friends";
+    }
   | StatusServerEvent;
 
 const app = new Hono<{ Variables: Variables }>();
@@ -156,6 +207,17 @@ const groupTyping = new Map<
   unknown,
   Map<string, ReturnType<typeof setTimeout>>
 >();
+type ActiveCall = {
+  callId: string;
+  callerId: string;
+  calleeId: string;
+  callerClientKey: unknown;
+  calleeClientKey: unknown | null;
+  state: "ringing" | "connecting";
+  timeout: ReturnType<typeof setTimeout> | null;
+};
+const activeCalls = new Map<string, ActiveCall>();
+const activeCallByUser = new Map<string, string>();
 const getClientKey = (client: WSContext): unknown => client.raw ?? client;
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
@@ -294,6 +356,68 @@ const parseClientMessage = (rawValue: unknown): ClientMessage | null => {
       typeof id === "string" &&
       /^[1-9]\d{0,18}$/.test(id) &&
       BigInt(id) <= 9_223_372_036_854_775_807n;
+    const isCallId = (id: unknown): id is string =>
+      typeof id === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        id,
+      );
+    const validSdp = (sdp: unknown) =>
+      typeof sdp === "string" && sdp.length > 0 && sdp.length <= 65_536;
+    if (value.type === "call.offer")
+      return isCallId(value.callId) &&
+        isId(value.calleeId) &&
+        validSdp(value.sdp)
+        ? {
+            type: value.type,
+            callId: value.callId,
+            calleeId: value.calleeId,
+            sdp: value.sdp as string,
+          }
+        : null;
+    if (value.type === "call.answer")
+      return isCallId(value.callId) && validSdp(value.sdp)
+        ? {
+            type: value.type,
+            callId: value.callId,
+            sdp: value.sdp as string,
+          }
+        : null;
+    if (value.type === "call.reject" || value.type === "call.end")
+      return isCallId(value.callId)
+        ? { type: value.type, callId: value.callId }
+        : null;
+    if (value.type === "call.ice_candidate") {
+      if (!isCallId(value.callId) || !isRecord(value.candidate)) return null;
+      const candidate = value.candidate;
+      if (
+        typeof candidate.candidate !== "string" ||
+        candidate.candidate.length > 4096 ||
+        (candidate.sdpMid != null && typeof candidate.sdpMid !== "string") ||
+        (candidate.sdpMLineIndex != null &&
+          (!Number.isInteger(candidate.sdpMLineIndex) ||
+            Number(candidate.sdpMLineIndex) < 0)) ||
+        (candidate.usernameFragment != null &&
+          typeof candidate.usernameFragment !== "string")
+      )
+        return null;
+      return {
+        type: value.type,
+        callId: value.callId,
+        candidate: {
+          candidate: candidate.candidate,
+          sdpMid:
+            typeof candidate.sdpMid === "string" ? candidate.sdpMid : null,
+          sdpMLineIndex:
+            candidate.sdpMLineIndex == null
+              ? null
+              : Number(candidate.sdpMLineIndex),
+          usernameFragment:
+            typeof candidate.usernameFragment === "string"
+              ? candidate.usernameFragment
+              : null,
+        },
+      };
+    }
     if (value.type === "chat.sync") return { type: "chat.sync" };
     if (
       value.type === "group.read" ||
@@ -445,6 +569,43 @@ const addConnection = (user: PublicUser, client: WSContext) => {
   chatStatus.connected(user, client, firstConnection);
 };
 
+const clearActiveCall = (call: ActiveCall) => {
+  if (call.timeout) clearTimeout(call.timeout);
+  activeCalls.delete(call.callId);
+  if (activeCallByUser.get(call.callerId) === call.callId)
+    activeCallByUser.delete(call.callerId);
+  if (activeCallByUser.get(call.calleeId) === call.callId)
+    activeCallByUser.delete(call.calleeId);
+};
+
+const finishActiveCall = (
+  call: ActiveCall,
+  type: "call.reject" | "call.end",
+  fromUserId: string,
+  reason?: string,
+) => {
+  clearActiveCall(call);
+  const event: ServerMessage = {
+    type,
+    callId: call.callId,
+    fromUserId,
+    ...(reason ? { reason } : {}),
+  };
+  sendToUser(call.callerId, event);
+  sendToUser(call.calleeId, event);
+};
+
+const endCallsForClient = (clientKey: unknown, userId: string) => {
+  const callId = activeCallByUser.get(userId);
+  const call = callId ? activeCalls.get(callId) : null;
+  if (!call) return;
+  const ownsPeerConnection =
+    (call.callerId === userId && call.callerClientKey === clientKey) ||
+    (call.calleeId === userId && call.calleeClientKey === clientKey);
+  if (ownsPeerConnection)
+    finishActiveCall(call, "call.end", userId, "disconnected");
+};
+
 const removeConnection = (client: WSContext) => {
   const key = getClientKey(client);
   for (const [groupId, timer] of groupTyping.get(key) ?? []) {
@@ -464,6 +625,7 @@ const removeConnection = (client: WSContext) => {
   }
   groupTyping.delete(key);
   const user = authenticatedClients.get(key);
+  if (user) endCallsForClient(key, user.id);
   authenticatedClients.delete(key);
   clientEventQueues.delete(key);
   if (!user) return;
@@ -472,7 +634,13 @@ const removeConnection = (client: WSContext) => {
   for (const connection of connections ?? []) {
     if (getClientKey(connection) === key) connections?.delete(connection);
   }
-  if (connections?.size === 0) connectionsByUser.delete(user.id);
+  if (connections?.size === 0) {
+    connectionsByUser.delete(user.id);
+    const callId = activeCallByUser.get(user.id);
+    const call = callId ? activeCalls.get(callId) : null;
+    if (call?.calleeId === user.id && call.state === "ringing")
+      finishActiveCall(call, "call.end", user.id, "disconnected");
+  }
   chatStatus.disconnected(user.id, client, !connectionsByUser.has(user.id));
 };
 
@@ -485,6 +653,125 @@ const sendToUser = (userId: string, message: ServerMessage) => {
 const sendToAllUsers = (message: ServerMessage) => {
   for (const userId of connectionsByUser.keys()) sendToUser(userId, message);
 };
+
+const handleCallMessage = async (
+  message: CallClientMessage,
+  sender: PublicUser,
+  client: WSContext,
+) => {
+  const senderKey = getClientKey(client);
+  if (message.type === "call.offer") {
+    if (
+      message.calleeId === sender.id ||
+      !(await areFriends(sender.id, message.calleeId))
+    ) {
+      sendJson(client, {
+        type: "call.unavailable",
+        callId: message.callId,
+        calleeId: message.calleeId,
+        reason: "not_friends",
+      });
+      return;
+    }
+    const calleeSettings = await getUserSettings(message.calleeId);
+    if (
+      !connectionsByUser.has(message.calleeId) ||
+      calleeSettings.presenceStatus === "invisible"
+    ) {
+      sendJson(client, {
+        type: "call.unavailable",
+        callId: message.callId,
+        calleeId: message.calleeId,
+        reason: "offline",
+      });
+      return;
+    }
+    // Re-check immediately before reserving both users. There is no await
+    // between this check and the Map writes, so simultaneous offers cannot
+    // claim the same participant.
+    if (
+      activeCalls.has(message.callId) ||
+      activeCallByUser.has(sender.id) ||
+      activeCallByUser.has(message.calleeId)
+    ) {
+      sendJson(client, {
+        type: "call.unavailable",
+        callId: message.callId,
+        calleeId: message.calleeId,
+        reason: "busy",
+      });
+      return;
+    }
+    const call: ActiveCall = {
+      callId: message.callId,
+      callerId: sender.id,
+      calleeId: message.calleeId,
+      callerClientKey: senderKey,
+      calleeClientKey: null,
+      state: "ringing",
+      timeout: null,
+    };
+    call.timeout = setTimeout(
+      () => finishActiveCall(call, "call.end", sender.id, "no_answer"),
+      30_000,
+    );
+    activeCalls.set(call.callId, call);
+    activeCallByUser.set(call.callerId, call.callId);
+    activeCallByUser.set(call.calleeId, call.callId);
+    sendToUser(call.calleeId, {
+      type: "call.offer",
+      callId: call.callId,
+      caller: {
+        id: sender.id,
+        username: sender.username,
+        avatarUrl: sender.avatarUrl,
+      },
+      sdp: message.sdp,
+    });
+    return;
+  }
+
+  const call = activeCalls.get(message.callId);
+  if (!call || (sender.id !== call.callerId && sender.id !== call.calleeId))
+    return;
+
+  if (message.type === "call.answer") {
+    if (sender.id !== call.calleeId || call.state !== "ringing") return;
+    if (call.timeout) clearTimeout(call.timeout);
+    call.timeout = null;
+    call.state = "connecting";
+    call.calleeClientKey = senderKey;
+    const event: ServerMessage = {
+      type: "call.answer",
+      callId: call.callId,
+      fromUserId: sender.id,
+      sdp: message.sdp,
+    };
+    sendToUser(call.callerId, event);
+    sendToUser(call.calleeId, event);
+    return;
+  }
+  if (message.type === "call.ice_candidate") {
+    const peerId = sender.id === call.callerId ? call.calleeId : call.callerId;
+    sendToUser(peerId, {
+      type: "call.ice_candidate",
+      callId: call.callId,
+      fromUserId: sender.id,
+      candidate: message.candidate,
+    });
+    return;
+  }
+  if (message.type === "call.reject") {
+    if (sender.id === call.calleeId && call.state === "ringing")
+      finishActiveCall(call, "call.reject", sender.id);
+    return;
+  }
+  finishActiveCall(call, "call.end", sender.id);
+};
+
+const isCallClientMessage = (
+  message: ClientMessage,
+): message is CallClientMessage => message.type.startsWith("call.");
 
 const broadcastToGroup = async (
   groupId: string,
@@ -1494,6 +1781,20 @@ app.get(
               });
               client.close(1008, "Session expired");
               removeConnection(client);
+              return;
+            }
+            if (isCallClientMessage(message)) {
+              try {
+                await handleCallMessage(message, sender, client);
+              } catch (error) {
+                console.error("Failed to handle voice call signal", error);
+                sendJson(client, {
+                  type: "error",
+                  data: {
+                    message: "Voice call signaling failed. Please try again.",
+                  },
+                });
+              }
               return;
             }
             if (
