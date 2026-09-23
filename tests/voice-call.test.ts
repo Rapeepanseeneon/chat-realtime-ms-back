@@ -90,6 +90,7 @@ const origin = Bun.env.FRONTEND_URL ?? "http://localhost:3000";
         calleeId: b.id,
         callerId: c.id,
         sdp: "offer-one",
+        callType: "video",
       });
       await until(() =>
         sb.events.some(
@@ -102,6 +103,7 @@ const origin = Bun.env.FRONTEND_URL ?? "http://localhost:3000";
           event.type === "call.offer" && event.callId === rejectedCallId,
       );
       expect(offer.caller.id).toBe(a.id);
+      expect(offer.callType).toBe("video");
       expect(sc.events.some((event) => event.callId === rejectedCallId)).toBe(
         false,
       );
@@ -112,6 +114,7 @@ const origin = Bun.env.FRONTEND_URL ?? "http://localhost:3000";
         callId: duplicateId,
         calleeId: b.id,
         sdp: "duplicate",
+        callType: "video",
       });
       await until(() =>
         sa.events.some(
@@ -135,6 +138,7 @@ const origin = Bun.env.FRONTEND_URL ?? "http://localhost:3000";
         callId: unauthorizedId,
         calleeId: b.id,
         sdp: "intrusion",
+        callType: "video",
       });
       await until(() =>
         sc.events.some(
@@ -154,6 +158,7 @@ const origin = Bun.env.FRONTEND_URL ?? "http://localhost:3000";
         callId: connectedCallId,
         calleeId: b.id,
         sdp: "offer-two",
+        callType: "voice",
       });
       await until(() =>
         sb.events.some(
@@ -212,6 +217,7 @@ const origin = Bun.env.FRONTEND_URL ?? "http://localhost:3000";
         callId: disconnectedCallId,
         calleeId: b.id,
         sdp: "disconnect-test",
+        callType: "voice",
       });
       await until(() =>
         sb.events.some(
@@ -234,6 +240,7 @@ const origin = Bun.env.FRONTEND_URL ?? "http://localhost:3000";
         callId: offlineId,
         calleeId: b.id,
         sdp: "offline",
+        callType: "voice",
       });
       await until(() =>
         sa.events.some(

@@ -81,6 +81,11 @@ typings/
 .env
 .env.test
 
+# Local development TLS material
+certs/
+*.pem
+*.key
+
 # Local avatar storage (replaceable by object storage in production)
 storage/avatars/
 

@@ -1,7 +1,7 @@
 import { Hono, type Context, type Next } from "hono";
 import type { SQL } from "bun";
 import { mkdir, unlink } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { upgradeWebSocket, websocket } from "hono/bun";
 import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
@@ -89,15 +89,39 @@ const MAX_BIO_LENGTH = 150;
 const MAX_AVATAR_BYTES = 5 * 1024 * 1024;
 const SESSION_DURATION_SECONDS = 60 * 60 * 24 * 7;
 const SESSION_COOKIE = "pb_session";
-const frontendUrl = (Bun.env.FRONTEND_URL ?? "http://localhost:3000").replace(
-  /\/$/,
-  "",
-);
+const normalizeOrigin = (value: string) => {
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === "http:" || url.protocol === "https:"
+      ? url.origin
+      : null;
+  } catch {
+    return null;
+  }
+};
+const configuredFrontendOrigins = (
+  Bun.env.FRONTEND_URLS ??
+  Bun.env.FRONTEND_URL ??
+  "http://localhost:3000"
+)
+  .split(",")
+  .map(normalizeOrigin)
+  .filter((origin): origin is string => origin !== null);
+if (configuredFrontendOrigins.length === 0)
+  throw new Error("FRONTEND_URLS must contain at least one valid HTTP origin");
+const frontendOrigins = new Set(configuredFrontendOrigins);
+const isTrustedFrontendOrigin = (origin: string | undefined) =>
+  !!origin && frontendOrigins.has(normalizeOrigin(origin) ?? "");
+const devHttpsEnabled = Bun.env.DEV_HTTPS === "true";
+if (devHttpsEnabled && Bun.env.NODE_ENV === "production") {
+  throw new Error("DEV_HTTPS is only supported outside production");
+}
 const avatarStorageDirectory = join(
   process.cwd(),
   Bun.env.AVATAR_STORAGE_DIR?.trim() || "storage/avatars",
 );
 const secureCookies =
+  devHttpsEnabled ||
   Bun.env.COOKIE_SECURE === "true" ||
   (Bun.env.COOKIE_SECURE !== "false" && Bun.env.NODE_ENV === "production");
 
@@ -114,6 +138,7 @@ type CallClientMessage =
       callId: string;
       calleeId: string;
       sdp: string;
+      callType: "voice" | "video";
     }
   | { type: "call.answer"; callId: string; sdp: string }
   | {
@@ -172,6 +197,7 @@ type ServerMessage =
       callId: string;
       caller: Pick<PublicUser, "id" | "username" | "avatarUrl">;
       sdp: string;
+      callType: "voice" | "video";
     }
   | {
       type: "call.answer";
@@ -337,13 +363,23 @@ const requireAuth = async (
 const requireTrustedOrigin = async (context: Context, next: Next) => {
   if (["POST", "PUT", "PATCH", "DELETE"].includes(context.req.method)) {
     const origin = context.req.header("Origin");
-    if (origin && origin !== frontendUrl) {
+    if (origin && !isTrustedFrontendOrigin(origin)) {
       return context.json(
         { error: "This request origin is not allowed." },
         403,
       );
     }
   }
+  await next();
+};
+
+const requireTrustedWebSocketOrigin = async (context: Context, next: Next) => {
+  const origin = context.req.header("Origin");
+  if (origin && !isTrustedFrontendOrigin(origin))
+    return context.json(
+      { error: "This WebSocket origin is not allowed." },
+      403,
+    );
   await next();
 };
 
@@ -366,12 +402,17 @@ const parseClientMessage = (rawValue: unknown): ClientMessage | null => {
     if (value.type === "call.offer")
       return isCallId(value.callId) &&
         isId(value.calleeId) &&
-        validSdp(value.sdp)
+        validSdp(value.sdp) &&
+        (value.callType === undefined ||
+          value.callType === "voice" ||
+          value.callType === "video")
         ? {
             type: value.type,
             callId: value.callId,
             calleeId: value.calleeId,
             sdp: value.sdp as string,
+            // Missing means voice for compatibility with already-open Step 12 clients.
+            callType: value.callType === "video" ? "video" : "voice",
           }
         : null;
     if (value.type === "call.answer")
@@ -727,6 +768,7 @@ const handleCallMessage = async (
         avatarUrl: sender.avatarUrl,
       },
       sdp: message.sdp,
+      callType: message.callType,
     });
     return;
   }
@@ -869,7 +911,7 @@ const saveAttachmentMessage = async (
 app.use(
   "/api/*",
   cors({
-    origin: frontendUrl,
+    origin: (origin) => (isTrustedFrontendOrigin(origin) ? origin : ""),
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type"],
     credentials: true,
@@ -1739,6 +1781,7 @@ app.get(
   },
 );
 
+app.use("/ws", requireTrustedWebSocketOrigin);
 app.use("/ws", requireAuth);
 app.get(
   "/ws",
@@ -2213,9 +2256,26 @@ const port = Number(Bun.env.PORT ?? 3001);
 if (!Number.isInteger(port) || port < 1 || port > 65_535) {
   throw new Error("PORT must be an integer between 1 and 65535");
 }
+const devTls = await (async () => {
+  if (!devHttpsEnabled) return undefined;
+  const certPath = Bun.env.TLS_CERT_PATH?.trim();
+  const keyPath = Bun.env.TLS_KEY_PATH?.trim();
+  if (!certPath || !keyPath) {
+    throw new Error(
+      "TLS_CERT_PATH and TLS_KEY_PATH are required when DEV_HTTPS=true",
+    );
+  }
+  const cert = Bun.file(resolve(process.cwd(), certPath));
+  const key = Bun.file(resolve(process.cwd(), keyPath));
+  if (!(await cert.exists()) || !(await key.exists())) {
+    throw new Error("The configured development TLS certificate was not found");
+  }
+  return { cert, key };
+})();
 // Start background work only after binding succeeds. A duplicate development
 // process that fails to bind must not claim scheduled rows without recipients.
-const createServer = () => Bun.serve({ port, fetch: app.fetch, websocket });
+const createServer = () =>
+  Bun.serve({ port, fetch: app.fetch, websocket, tls: devTls });
 const serverRuntime = globalThis as typeof globalThis & {
   pbMessengerServer?: ReturnType<typeof createServer>;
 };
@@ -2226,4 +2286,8 @@ if (serverRuntime.pbMessengerServer) {
 }
 export const server = serverRuntime.pbMessengerServer;
 startGhostScheduler(publishReleasedGhost);
-console.info(`Realtime chat backend listening on http://localhost:${port}`);
+const backendProtocol = devHttpsEnabled ? "https" : "http";
+console.info(
+  `Realtime chat backend listening on ${backendProtocol}://localhost:${port}`,
+);
+console.info(`Allowed frontend origins: ${[...frontendOrigins].join(", ")}`);
