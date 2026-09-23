@@ -17,6 +17,12 @@ const origins = (Bun.env.CHAT_TEST_FRONTEND_ORIGINS ?? "")
     const emails: string[] = [];
     const sockets: WebSocket[] = [];
     try {
+      const anonymousOnboarding = await fetch(
+        `${api}/api/onboarding/complete`,
+        { method: "POST", headers: { Origin: origins[0] } },
+      );
+      expect(anonymousOnboarding.status).toBe(401);
+
       for (const [index, origin] of origins.entries()) {
         const email = `lan-auth-${index}-${suffix}@example.test`;
         const password = "Lan-auth-test-42";
@@ -48,6 +54,30 @@ const origins = (Bun.env.CHAT_TEST_FRONTEND_ORIGINS ?? "")
           }),
         });
         expect(register.status).toBe(201);
+        const registrationCookie = (
+          register.headers.get("set-cookie") ?? ""
+        ).split(";", 1)[0];
+        expect(registrationCookie).toContain("pb_session=");
+        const registrationBody = (await register.json()) as {
+          user: { onboardingCompleted: boolean };
+        };
+        expect(registrationBody.user.onboardingCompleted).toBe(false);
+
+        const completeOnboarding = await fetch(
+          `${api}/api/onboarding/complete`,
+          {
+            method: "POST",
+            headers: { Origin: origin, Cookie: registrationCookie },
+          },
+        );
+        expect(completeOnboarding.status).toBe(200);
+        expect(
+          (
+            (await completeOnboarding.json()) as {
+              user: { onboardingCompleted: boolean };
+            }
+          ).user.onboardingCompleted,
+        ).toBe(true);
 
         const login = await fetch(`${api}/api/auth/login`, {
           method: "POST",
@@ -68,7 +98,13 @@ const origins = (Bun.env.CHAT_TEST_FRONTEND_ORIGINS ?? "")
           headers: { Origin: origin, Cookie: cookie },
         });
         expect(me.status).toBe(200);
-        expect(((await me.json()) as any).user.email).toBe(email);
+        const currentUser = (
+          (await me.json()) as {
+            user: { email: string; onboardingCompleted: boolean };
+          }
+        ).user;
+        expect(currentUser.email).toBe(email);
+        expect(currentUser.onboardingCompleted).toBe(true);
 
         if (Bun.env.CHAT_TEST_VERIFY_FRONTEND === "true") {
           const chat = await fetch(`${origin}/chat`, {

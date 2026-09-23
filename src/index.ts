@@ -18,7 +18,8 @@ import {
   releaseGhost,
   publishPendingGhosts,
   createSession,
-  createUser,
+  createUserWithSession,
+  completeOnboarding,
   deleteSession,
   findConflictingUser,
   findChatUserById,
@@ -978,11 +979,22 @@ app.post("/api/auth/register", async (context) => {
 
   try {
     const passwordHash = await Bun.password.hash(password, "argon2id");
-    const user = await createUser(
+    const token = createSessionToken();
+    const expiresAt = new Date(Date.now() + SESSION_DURATION_SECONDS * 1_000);
+    const user = await createUserWithSession(
       profile.username,
       profile.email,
       passwordHash,
+      hashSessionToken(token),
+      expiresAt,
     );
+    setCookie(context, SESSION_COOKIE, token, {
+      httpOnly: true,
+      secure: secureCookies,
+      sameSite: "Lax",
+      path: "/",
+      maxAge: SESSION_DURATION_SECONDS,
+    });
     return context.json(
       { user: toPublicUser(user), message: "Account created successfully." },
       201,
@@ -1039,6 +1051,23 @@ app.post("/api/auth/login", async (context) => {
 app.get("/api/auth/me", requireAuth, (context) =>
   context.json({ user: context.get("user") }),
 );
+
+app.post("/api/onboarding/complete", requireAuth, async (context) => {
+  try {
+    const user = await completeOnboarding(context.get("user").id);
+    if (!user) return context.json({ error: "User was not found." }, 404);
+    return context.json({
+      user,
+      message: "Onboarding completed successfully.",
+    });
+  } catch (error) {
+    console.error("Failed to complete onboarding", error);
+    return context.json(
+      { error: "Onboarding could not be completed. Please try again." },
+      500,
+    );
+  }
+});
 
 app.post("/api/auth/logout", async (context) => {
   const token = getCookie(context, SESSION_COOKIE);

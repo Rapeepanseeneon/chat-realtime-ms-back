@@ -135,6 +135,7 @@ export type User = {
   passwordHash: string;
   avatarUrl: string | null;
   bio: string;
+  onboardingCompleted: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -197,6 +198,7 @@ type UserRow = {
   passwordHash: string;
   avatarUrl: string | null;
   bio: string;
+  onboardingCompleted: boolean;
   createdAt: Date | string;
   updatedAt: Date | string;
 };
@@ -311,6 +313,7 @@ const normalizeUser = (row: UserRow): User => ({
   passwordHash: row.passwordHash,
   avatarUrl: row.avatarUrl,
   bio: row.bio,
+  onboardingCompleted: row.onboardingCompleted,
   createdAt: toIsoString(row.createdAt),
   updatedAt: toIsoString(row.updatedAt),
 });
@@ -337,6 +340,7 @@ export const initializeDatabase = async () => {
   await database`CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique_idx ON users (lower(email))`;
   await database`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`;
   await database`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio VARCHAR(150) NOT NULL DEFAULT ''`;
+  await database`ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN NOT NULL DEFAULT TRUE`;
   await database`
     CREATE TABLE IF NOT EXISTS user_settings (
       user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -532,17 +536,40 @@ export const createUser = async (
   passwordHash: string,
 ): Promise<User> => {
   const [user] = await database<UserRow[]>`
-    INSERT INTO users (username, email, password_hash)
-    VALUES (${username}, ${email}, ${passwordHash})
-    RETURNING id::text AS id, username, email, password_hash AS "passwordHash", avatar_url AS "avatarUrl", bio, created_at AS "createdAt", updated_at AS "updatedAt"
+    INSERT INTO users (username, email, password_hash, onboarding_completed)
+    VALUES (${username}, ${email}, ${passwordHash}, FALSE)
+    RETURNING id::text AS id, username, email, password_hash AS "passwordHash", avatar_url AS "avatarUrl", bio, onboarding_completed AS "onboardingCompleted", created_at AS "createdAt", updated_at AS "updatedAt"
   `;
   if (!user) throw new Error("PostgreSQL did not return the inserted user");
   return normalizeUser(user);
 };
 
+export const createUserWithSession = async (
+  username: string,
+  email: string,
+  passwordHash: string,
+  tokenHash: string,
+  expiresAt: Date,
+): Promise<User> =>
+  database.begin(async (transaction) => {
+    const [user] = await transaction<UserRow[]>`
+      INSERT INTO users (username, email, password_hash, onboarding_completed)
+      VALUES (${username}, ${email}, ${passwordHash}, FALSE)
+      RETURNING id::text AS id, username, email, password_hash AS "passwordHash",
+        avatar_url AS "avatarUrl", bio, onboarding_completed AS "onboardingCompleted",
+        created_at AS "createdAt", updated_at AS "updatedAt"
+    `;
+    if (!user) throw new Error("PostgreSQL did not return the inserted user");
+    await transaction`
+      INSERT INTO sessions (user_id, token_hash, expires_at)
+      VALUES (${user.id}, ${tokenHash}, ${expiresAt})
+    `;
+    return normalizeUser(user);
+  });
+
 export const findUserByEmail = async (email: string): Promise<User | null> => {
   const [user] = await database<UserRow[]>`
-    SELECT id::text AS id, username, email, password_hash AS "passwordHash", avatar_url AS "avatarUrl", bio, created_at AS "createdAt", updated_at AS "updatedAt"
+    SELECT id::text AS id, username, email, password_hash AS "passwordHash", avatar_url AS "avatarUrl", bio, onboarding_completed AS "onboardingCompleted", created_at AS "createdAt", updated_at AS "updatedAt"
     FROM users WHERE lower(email) = lower(${email}) LIMIT 1
   `;
   return user ? normalizeUser(user) : null;
@@ -771,7 +798,7 @@ export const updateUser = async (
   const [user] = await database<UserRow[]>`
     UPDATE users SET username = ${username}, email = ${email}, bio = ${bio}, updated_at = NOW()
     WHERE id = ${userId}
-    RETURNING id::text AS id, username, email, password_hash AS "passwordHash", avatar_url AS "avatarUrl", bio, created_at AS "createdAt", updated_at AS "updatedAt"
+    RETURNING id::text AS id, username, email, password_hash AS "passwordHash", avatar_url AS "avatarUrl", bio, onboarding_completed AS "onboardingCompleted", created_at AS "createdAt", updated_at AS "updatedAt"
   `;
   if (!user) throw new Error("User was not found");
   return normalizeUser(user);
@@ -826,7 +853,7 @@ export const setUserAvatar = async (
     UPDATE users SET avatar_url = ${avatarUrl}, updated_at = NOW()
     WHERE id = ${userId}
     RETURNING id::text AS id, username, email, password_hash AS "passwordHash",
-      avatar_url AS "avatarUrl", bio, created_at AS "createdAt", updated_at AS "updatedAt"
+      avatar_url AS "avatarUrl", bio, onboarding_completed AS "onboardingCompleted", created_at AS "createdAt", updated_at AS "updatedAt"
   `;
   if (!user) throw new Error("User was not found");
   return {
@@ -943,6 +970,7 @@ export const findUserBySession = async (
   const [user] = await database<UserRow[]>`
     SELECT users.id::text AS id, users.username, users.email,
       users.password_hash AS "passwordHash", users.avatar_url AS "avatarUrl", users.bio,
+      users.onboarding_completed AS "onboardingCompleted",
       users.created_at AS "createdAt", users.updated_at AS "updatedAt"
     FROM sessions JOIN users ON users.id = sessions.user_id
     WHERE sessions.token_hash = ${tokenHash} AND sessions.expires_at > NOW()
@@ -953,6 +981,20 @@ export const findUserBySession = async (
 
 export const deleteSession = async (tokenHash: string) => {
   await database`DELETE FROM sessions WHERE token_hash = ${tokenHash}`;
+};
+
+export const completeOnboarding = async (
+  userId: string,
+): Promise<PublicUser | null> => {
+  const [user] = await database<UserRow[]>`
+    UPDATE users
+    SET onboarding_completed = TRUE, updated_at = NOW()
+    WHERE id = ${userId}
+    RETURNING id::text AS id, username, email, password_hash AS "passwordHash",
+      avatar_url AS "avatarUrl", bio, onboarding_completed AS "onboardingCompleted",
+      created_at AS "createdAt", updated_at AS "updatedAt"
+  `;
+  return user ? toPublicUser(normalizeUser(user)) : null;
 };
 
 export const createMessage = async (
