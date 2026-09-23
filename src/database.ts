@@ -26,13 +26,56 @@ export type PublicProfile = ChatUser & {
 };
 
 export type FriendSearchResult = ChatUser & {
-  relationship: "none" | "outgoing_pending" | "incoming_pending" | "friends";
+  displayName: string;
+  relationship: RelationshipState;
+  requestId: string | null;
 };
 
 export type FriendRequest = {
   id: string;
   sender: ChatUser;
   createdAt: string;
+};
+
+export type RelationshipState =
+  "none" | "outgoing_pending" | "incoming_pending" | "friends";
+
+export type ProfilePrivacy = {
+  profileVisibility: "public" | "friends" | "private";
+  friendListVisibility: "everyone" | "friends" | "only_me";
+  mutualFriendsVisibility: "everyone" | "friends" | "only_me";
+  onlineStatusVisibility: "everyone" | "friends" | "nobody";
+};
+
+export type ProfileIdentity = {
+  id: string;
+  username: string;
+  displayName: string;
+  avatarUrl: string | null;
+};
+
+export type SentFriendRequest = {
+  id: string;
+  receiver: ProfileIdentity;
+  createdAt: string;
+};
+
+export type FriendSuggestion = ProfileIdentity & {
+  relationship: RelationshipState;
+  mutualFriendCount: number | null;
+};
+
+export type ProfileView = ProfileIdentity & {
+  bio: string | null;
+  links: ProfileLink[];
+  relationship: RelationshipState;
+  requestId: string | null;
+  isOwner: boolean;
+  isPrivate: boolean;
+  friendCount: number | null;
+  mutualFriendCount: number | null;
+  canViewOnline: boolean;
+  privacy: ProfilePrivacy | null;
 };
 
 export type CreateFriendRequestResult =
@@ -340,6 +383,7 @@ export const initializeDatabase = async () => {
   await database`CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique_idx ON users (lower(email))`;
   await database`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`;
   await database`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio VARCHAR(150) NOT NULL DEFAULT ''`;
+  await database`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(80)`;
   await database`ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN NOT NULL DEFAULT TRUE`;
   await database`
     CREATE TABLE IF NOT EXISTS user_settings (
@@ -401,6 +445,24 @@ export const initializeDatabase = async () => {
   await database`
     CREATE INDEX IF NOT EXISTS friend_requests_receiver_status_idx
     ON friend_requests (receiver_id, status, created_at DESC)
+  `;
+  await database`
+    CREATE INDEX IF NOT EXISTS friend_requests_sender_status_idx
+    ON friend_requests (sender_id, status, created_at DESC)
+  `;
+  await database`
+    CREATE TABLE IF NOT EXISTS profile_privacy (
+      user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      profile_visibility VARCHAR(10) NOT NULL DEFAULT 'friends',
+      friend_list_visibility VARCHAR(10) NOT NULL DEFAULT 'only_me',
+      mutual_friends_visibility VARCHAR(10) NOT NULL DEFAULT 'friends',
+      online_status_visibility VARCHAR(10) NOT NULL DEFAULT 'friends',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT profile_privacy_profile_valid CHECK (profile_visibility IN ('public','friends','private')),
+      CONSTRAINT profile_privacy_friend_list_valid CHECK (friend_list_visibility IN ('everyone','friends','only_me')),
+      CONSTRAINT profile_privacy_mutual_valid CHECK (mutual_friends_visibility IN ('everyone','friends','only_me')),
+      CONSTRAINT profile_privacy_online_valid CHECK (online_status_visibility IN ('everyone','friends','nobody'))
+    )
   `;
   await database`
     CREATE TABLE IF NOT EXISTS sessions (
@@ -536,8 +598,8 @@ export const createUser = async (
   passwordHash: string,
 ): Promise<User> => {
   const [user] = await database<UserRow[]>`
-    INSERT INTO users (username, email, password_hash, onboarding_completed)
-    VALUES (${username}, ${email}, ${passwordHash}, FALSE)
+    INSERT INTO users (username, display_name, email, password_hash, onboarding_completed)
+    VALUES (${username}, ${username}, ${email}, ${passwordHash}, FALSE)
     RETURNING id::text AS id, username, email, password_hash AS "passwordHash", avatar_url AS "avatarUrl", bio, onboarding_completed AS "onboardingCompleted", created_at AS "createdAt", updated_at AS "updatedAt"
   `;
   if (!user) throw new Error("PostgreSQL did not return the inserted user");
@@ -553,8 +615,8 @@ export const createUserWithSession = async (
 ): Promise<User> =>
   database.begin(async (transaction) => {
     const [user] = await transaction<UserRow[]>`
-      INSERT INTO users (username, email, password_hash, onboarding_completed)
-      VALUES (${username}, ${email}, ${passwordHash}, FALSE)
+      INSERT INTO users (username, display_name, email, password_hash, onboarding_completed)
+      VALUES (${username}, ${username}, ${email}, ${passwordHash}, FALSE)
       RETURNING id::text AS id, username, email, password_hash AS "passwordHash",
         avatar_url AS "avatarUrl", bio, onboarding_completed AS "onboardingCompleted",
         created_at AS "createdAt", updated_at AS "updatedAt"
@@ -576,6 +638,7 @@ export const findUserByEmail = async (email: string): Promise<User | null> => {
 };
 
 export type FriendListUser = ChatUser & {
+  displayName: string;
   favorite: boolean;
   recentAt: string | null;
 };
@@ -586,7 +649,10 @@ export const getFriends = async (
   const rows = await database<
     (FriendListUser & { recentAt: Date | string | null })[]
   >`
-    SELECT users.id::text AS id, users.username, users.avatar_url AS "avatarUrl", users.bio,
+    SELECT users.id::text AS id, users.username,
+      COALESCE(NULLIF(users.display_name, ''), users.username) AS "displayName",
+      users.avatar_url AS "avatarUrl",
+      CASE WHEN COALESCE(privacy.profile_visibility, 'friends') = 'private' THEN '' ELSE users.bio END AS bio,
       (favorite.friend_id IS NOT NULL) AS favorite,
       GREATEST(private_recent.recent_at, group_recent.recent_at) AS "recentAt"
     FROM friend_requests
@@ -595,6 +661,7 @@ export const getFriends = async (
         THEN friend_requests.receiver_id
       ELSE friend_requests.sender_id
     END
+    LEFT JOIN profile_privacy privacy ON privacy.user_id = users.id
     LEFT JOIN favorite_friends favorite ON favorite.user_id = ${currentUserId} AND favorite.friend_id = users.id
     LEFT JOIN LATERAL (
       SELECT max(created_at) AS recent_at FROM messages
@@ -624,7 +691,9 @@ export const searchUsers = async (
   return database<FriendSearchResult[]>`
     SELECT
       users.id::text AS id,
-      users.username, users.avatar_url AS "avatarUrl", users.bio,
+      users.username, COALESCE(NULLIF(users.display_name, ''), users.username) AS "displayName",
+      users.avatar_url AS "avatarUrl", '' AS bio,
+      friend_requests.id::text AS "requestId",
       CASE
         WHEN friend_requests.status = 'accepted' THEN 'friends'
         WHEN friend_requests.status = 'pending'
@@ -660,7 +729,7 @@ export const getReceivedFriendRequests = async (
       users.id::text AS "senderId",
       users.username AS "senderUsername",
       users.avatar_url AS "senderAvatarUrl",
-      users.bio AS "senderBio",
+      '' AS "senderBio",
       friend_requests.created_at AS "createdAt"
     FROM friend_requests
     JOIN users ON users.id = friend_requests.sender_id
@@ -751,6 +820,290 @@ export const respondToFriendRequest = async (
   return rows.length === 1;
 };
 
+export const getSentFriendRequests = async (
+  currentUserId: string,
+): Promise<SentFriendRequest[]> => {
+  const rows = await database<
+    (SentFriendRequest & { createdAt: Date | string })[]
+  >`
+    SELECT friend_requests.id::text AS id,
+      json_build_object(
+        'id', users.id::text,
+        'username', users.username,
+        'displayName', COALESCE(NULLIF(users.display_name, ''), users.username),
+        'avatarUrl', users.avatar_url
+      ) AS receiver,
+      friend_requests.created_at AS "createdAt"
+    FROM friend_requests
+    JOIN users ON users.id = friend_requests.receiver_id
+    WHERE friend_requests.sender_id = ${currentUserId}
+      AND friend_requests.status = 'pending'
+    ORDER BY friend_requests.created_at DESC, friend_requests.id DESC
+  `;
+  return rows.map((row) => ({
+    ...row,
+    createdAt: toIsoString(row.createdAt),
+  }));
+};
+
+export const cancelFriendRequest = async (
+  requestId: string,
+  senderId: string,
+): Promise<boolean> => {
+  const rows = await database<{ id: string }[]>`
+    DELETE FROM friend_requests
+    WHERE id::text = ${requestId}
+      AND sender_id = ${senderId}
+      AND status = 'pending'
+    RETURNING id::text AS id
+  `;
+  return rows.length === 1;
+};
+
+export const getFriendSuggestions = async (
+  currentUserId: string,
+  limit = 12,
+): Promise<FriendSuggestion[]> => {
+  const rows = await database<
+    (Omit<FriendSuggestion, "mutualFriendCount"> & {
+      mutualFriendCount: number | string | null;
+    })[]
+  >`
+    WITH my_friends AS (
+      SELECT CASE WHEN sender_id = ${currentUserId} THEN receiver_id ELSE sender_id END AS friend_id
+      FROM friend_requests
+      WHERE status = 'accepted'
+        AND (sender_id = ${currentUserId} OR receiver_id = ${currentUserId})
+    ), candidates AS (
+      SELECT CASE WHEN request.sender_id = mine.friend_id THEN request.receiver_id ELSE request.sender_id END AS candidate_id,
+        count(DISTINCT mine.friend_id)::int AS mutual_count
+      FROM my_friends mine
+      JOIN friend_requests request
+        ON request.status = 'accepted'
+       AND (request.sender_id = mine.friend_id OR request.receiver_id = mine.friend_id)
+      GROUP BY candidate_id
+    )
+    SELECT users.id::text AS id, users.username,
+      COALESCE(NULLIF(users.display_name, ''), users.username) AS "displayName",
+      users.avatar_url AS "avatarUrl",
+      CASE
+        WHEN relationship.status = 'accepted' THEN 'friends'
+        WHEN relationship.status = 'pending' AND relationship.sender_id = ${currentUserId} THEN 'outgoing_pending'
+        WHEN relationship.status = 'pending' THEN 'incoming_pending'
+        ELSE 'none'
+      END AS relationship,
+      CASE
+        WHEN COALESCE(privacy.mutual_friends_visibility, 'friends') = 'everyone'
+          THEN candidates.mutual_count
+        ELSE NULL
+      END AS "mutualFriendCount"
+    FROM candidates
+    JOIN users ON users.id = candidates.candidate_id
+    LEFT JOIN profile_privacy privacy ON privacy.user_id = users.id
+    LEFT JOIN friend_requests relationship
+      ON LEAST(relationship.sender_id, relationship.receiver_id) = LEAST(users.id, ${currentUserId}::bigint)
+     AND GREATEST(relationship.sender_id, relationship.receiver_id) = GREATEST(users.id, ${currentUserId}::bigint)
+    WHERE users.id <> ${currentUserId}
+      AND NOT EXISTS (SELECT 1 FROM my_friends WHERE friend_id = users.id)
+    ORDER BY candidates.mutual_count DESC, lower(users.username), users.id
+    LIMIT ${limit}
+  `;
+  return rows.map((row) => ({
+    ...row,
+    mutualFriendCount:
+      row.mutualFriendCount == null ? null : Number(row.mutualFriendCount),
+  }));
+};
+
+const defaultProfilePrivacy: ProfilePrivacy = {
+  profileVisibility: "friends",
+  friendListVisibility: "only_me",
+  mutualFriendsVisibility: "friends",
+  onlineStatusVisibility: "friends",
+};
+
+export const getProfilePrivacy = async (
+  userId: string,
+): Promise<ProfilePrivacy> => {
+  const [row] = await database<ProfilePrivacy[]>`
+    SELECT profile_visibility AS "profileVisibility",
+      friend_list_visibility AS "friendListVisibility",
+      mutual_friends_visibility AS "mutualFriendsVisibility",
+      online_status_visibility AS "onlineStatusVisibility"
+    FROM profile_privacy WHERE user_id = ${userId}
+  `;
+  return row ?? defaultProfilePrivacy;
+};
+
+export type PresencePreference = {
+  userId: string;
+  presenceStatus: PresenceStatus;
+  customStatus: string;
+  showOnlineStatus: boolean;
+  onlineStatusVisibility: ProfilePrivacy["onlineStatusVisibility"];
+};
+
+export const getPresencePreferences = async (
+  userIds: string[],
+): Promise<Map<string, PresencePreference>> => {
+  if (userIds.length === 0) return new Map();
+  const rows = await database<PresencePreference[]>`
+    SELECT users.id::text AS "userId",
+      COALESCE(settings.presence_status, 'online') AS "presenceStatus",
+      COALESCE(settings.custom_status, '') AS "customStatus",
+      COALESCE(settings.show_online_status, TRUE) AS "showOnlineStatus",
+      COALESCE(privacy.online_status_visibility, 'friends') AS "onlineStatusVisibility"
+    FROM users
+    LEFT JOIN user_settings settings ON settings.user_id = users.id
+    LEFT JOIN profile_privacy privacy ON privacy.user_id = users.id
+    WHERE users.id IN ${database(userIds)}
+  `;
+  return new Map(rows.map((row) => [row.userId, row]));
+};
+
+export const updateProfilePrivacy = async (
+  userId: string,
+  privacy: ProfilePrivacy,
+): Promise<ProfilePrivacy> => {
+  const [row] = await database<ProfilePrivacy[]>`
+    INSERT INTO profile_privacy(
+      user_id, profile_visibility, friend_list_visibility,
+      mutual_friends_visibility, online_status_visibility, updated_at
+    ) VALUES (
+      ${userId}, ${privacy.profileVisibility}, ${privacy.friendListVisibility},
+      ${privacy.mutualFriendsVisibility}, ${privacy.onlineStatusVisibility}, NOW()
+    )
+    ON CONFLICT (user_id) DO UPDATE SET
+      profile_visibility = EXCLUDED.profile_visibility,
+      friend_list_visibility = EXCLUDED.friend_list_visibility,
+      mutual_friends_visibility = EXCLUDED.mutual_friends_visibility,
+      online_status_visibility = EXCLUDED.online_status_visibility,
+      updated_at = NOW()
+    RETURNING profile_visibility AS "profileVisibility",
+      friend_list_visibility AS "friendListVisibility",
+      mutual_friends_visibility AS "mutualFriendsVisibility",
+      online_status_visibility AS "onlineStatusVisibility"
+  `;
+  if (!row) throw new Error("Profile privacy could not be updated");
+  return row;
+};
+
+export const getProfileByUsername = async (
+  viewerId: string,
+  username: string,
+): Promise<ProfileView | null> => {
+  const [row] = await database<
+    (ProfileIdentity & {
+      bio: string;
+      profileVisibility: ProfilePrivacy["profileVisibility"];
+      friendListVisibility: ProfilePrivacy["friendListVisibility"];
+      mutualFriendsVisibility: ProfilePrivacy["mutualFriendsVisibility"];
+      onlineStatusVisibility: ProfilePrivacy["onlineStatusVisibility"];
+      relationship: RelationshipState;
+      requestId: string | null;
+      friendCount: number | string;
+      mutualFriendCount: number | string;
+    })[]
+  >`
+    SELECT users.id::text AS id, users.username,
+      COALESCE(NULLIF(users.display_name, ''), users.username) AS "displayName",
+      users.avatar_url AS "avatarUrl", users.bio,
+      COALESCE(privacy.profile_visibility, 'friends') AS "profileVisibility",
+      COALESCE(privacy.friend_list_visibility, 'only_me') AS "friendListVisibility",
+      COALESCE(privacy.mutual_friends_visibility, 'friends') AS "mutualFriendsVisibility",
+      COALESCE(privacy.online_status_visibility, 'friends') AS "onlineStatusVisibility",
+      CASE
+        WHEN relationship.status = 'accepted' THEN 'friends'
+        WHEN relationship.status = 'pending' AND relationship.sender_id = ${viewerId} THEN 'outgoing_pending'
+        WHEN relationship.status = 'pending' THEN 'incoming_pending'
+        ELSE 'none'
+      END AS relationship,
+      relationship.id::text AS "requestId",
+      (SELECT count(*) FROM friend_requests f WHERE f.status = 'accepted'
+        AND (f.sender_id = users.id OR f.receiver_id = users.id))::int AS "friendCount",
+      (SELECT count(*) FROM (
+        SELECT CASE WHEN f.sender_id = ${viewerId} THEN f.receiver_id ELSE f.sender_id END friend_id
+        FROM friend_requests f WHERE f.status = 'accepted'
+          AND (f.sender_id = ${viewerId} OR f.receiver_id = ${viewerId})
+        INTERSECT
+        SELECT CASE WHEN f.sender_id = users.id THEN f.receiver_id ELSE f.sender_id END friend_id
+        FROM friend_requests f WHERE f.status = 'accepted'
+          AND (f.sender_id = users.id OR f.receiver_id = users.id)
+      ) mutual)::int AS "mutualFriendCount"
+    FROM users
+    LEFT JOIN profile_privacy privacy ON privacy.user_id = users.id
+    LEFT JOIN friend_requests relationship
+      ON LEAST(relationship.sender_id, relationship.receiver_id) = LEAST(users.id, ${viewerId}::bigint)
+     AND GREATEST(relationship.sender_id, relationship.receiver_id) = GREATEST(users.id, ${viewerId}::bigint)
+    WHERE lower(users.username) = lower(${username})
+    LIMIT 1
+  `;
+  if (!row) return null;
+  const isOwner = row.id === viewerId;
+  const isFriend = row.relationship === "friends";
+  const canViewDetails =
+    isOwner ||
+    row.profileVisibility === "public" ||
+    (row.profileVisibility === "friends" && isFriend);
+  const canViewFriends =
+    isOwner ||
+    row.friendListVisibility === "everyone" ||
+    (row.friendListVisibility === "friends" && isFriend);
+  const canViewMutual =
+    isOwner ||
+    row.mutualFriendsVisibility === "everyone" ||
+    (row.mutualFriendsVisibility === "friends" && isFriend);
+  const canViewOnline =
+    isOwner ||
+    row.onlineStatusVisibility === "everyone" ||
+    (row.onlineStatusVisibility === "friends" && isFriend);
+  return {
+    id: row.id,
+    username: row.username,
+    displayName: row.displayName,
+    avatarUrl: row.avatarUrl,
+    bio: canViewDetails ? row.bio : null,
+    links: canViewDetails ? await getProfileLinks(row.id) : [],
+    relationship: row.relationship,
+    requestId: row.requestId,
+    isOwner,
+    isPrivate: !canViewDetails,
+    friendCount: canViewFriends ? Number(row.friendCount) : null,
+    mutualFriendCount: canViewMutual ? Number(row.mutualFriendCount) : null,
+    canViewOnline,
+    privacy: isOwner
+      ? {
+          profileVisibility: row.profileVisibility,
+          friendListVisibility: row.friendListVisibility,
+          mutualFriendsVisibility: row.mutualFriendsVisibility,
+          onlineStatusVisibility: row.onlineStatusVisibility,
+        }
+      : null,
+  };
+};
+
+export const getVisibleProfileFriends = async (
+  viewerId: string,
+  username: string,
+): Promise<ProfileIdentity[] | null> => {
+  const profile = await getProfileByUsername(viewerId, username);
+  if (!profile || profile.friendCount === null) return null;
+  return database<ProfileIdentity[]>`
+    SELECT users.id::text AS id, users.username,
+      COALESCE(NULLIF(users.display_name, ''), users.username) AS "displayName",
+      users.avatar_url AS "avatarUrl"
+    FROM friend_requests request
+    JOIN users ON users.id = CASE
+      WHEN request.sender_id = ${profile.id} THEN request.receiver_id
+      ELSE request.sender_id
+    END
+    WHERE request.status = 'accepted'
+      AND (request.sender_id = ${profile.id} OR request.receiver_id = ${profile.id})
+    ORDER BY lower(users.username), users.id
+    LIMIT 100
+  `;
+};
+
 export const findChatUserById = async (
   userId: string,
 ): Promise<ChatUser | null> => {
@@ -794,9 +1147,11 @@ export const updateUser = async (
   username: string,
   email: string,
   bio = "",
+  displayName = username,
 ): Promise<User> => {
   const [user] = await database<UserRow[]>`
-    UPDATE users SET username = ${username}, email = ${email}, bio = ${bio}, updated_at = NOW()
+    UPDATE users SET username = ${username}, display_name = ${displayName},
+      email = ${email}, bio = ${bio}, updated_at = NOW()
     WHERE id = ${userId}
     RETURNING id::text AS id, username, email, password_hash AS "passwordHash", avatar_url AS "avatarUrl", bio, onboarding_completed AS "onboardingCompleted", created_at AS "createdAt", updated_at AS "updatedAt"
   `;
@@ -835,11 +1190,20 @@ export const getPublicProfile = async (
     !(await areFriends(viewerId, profileUserId))
   )
     return null;
-  const [user] = await database<ChatUser[]>`
-    SELECT id::text AS id, username, avatar_url AS "avatarUrl", bio
-    FROM users WHERE id = ${profileUserId} LIMIT 1
+  const [identity] = await database<{ username: string }[]>`
+    SELECT username FROM users WHERE id = ${profileUserId} LIMIT 1
   `;
-  return user ? { ...user, links: await getProfileLinks(profileUserId) } : null;
+  if (!identity) return null;
+  const profile = await getProfileByUsername(viewerId, identity.username);
+  return profile
+    ? {
+        id: profile.id,
+        username: profile.username,
+        avatarUrl: profile.avatarUrl,
+        bio: profile.bio ?? "",
+        links: profile.links,
+      }
+    : null;
 };
 
 export const setUserAvatar = async (

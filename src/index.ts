@@ -30,6 +30,9 @@ import {
   getFriendshipStatus,
   getPrivateMessages,
   getReceivedFriendRequests,
+  getSentFriendRequests,
+  cancelFriendRequest,
+  getFriendSuggestions,
   getRecentMessages,
   initializeDatabase,
   respondToFriendRequest,
@@ -39,6 +42,10 @@ import {
   getProfileLinks,
   replaceProfileLinks,
   getPublicProfile,
+  getProfileByUsername,
+  getVisibleProfileFriends,
+  updateProfilePrivacy,
+  getPresencePreferences,
   setUserAvatar,
   setFavoriteFriend,
   getUserSettings,
@@ -68,6 +75,7 @@ import {
   type MessageTextSize,
   type UserSettings,
   type NewAttachment,
+  type ProfilePrivacy,
 } from "./database";
 import {
   ChatStatusTracker,
@@ -275,10 +283,14 @@ const validateProfile = (value: Record<string, unknown>) => {
   const email =
     typeof value.email === "string" ? value.email.trim().toLowerCase() : "";
   const bio = typeof value.bio === "string" ? value.bio.trim() : "";
+  const displayName =
+    typeof value.displayName === "string" ? value.displayName.trim() : username;
 
   if (!username) return { error: "Username is required." } as const;
   if (username.length > 50)
     return { error: "Username must be 50 characters or fewer." } as const;
+  if (!displayName || displayName.length > 80)
+    return { error: "Display name must be 1-80 characters." } as const;
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
     return { error: "Please enter a valid email address." } as const;
   }
@@ -286,7 +298,32 @@ const validateProfile = (value: Record<string, unknown>) => {
     return {
       error: `Bio must be ${MAX_BIO_LENGTH} characters or fewer.`,
     } as const;
-  return { username, email, bio } as const;
+  return { username, email, bio, displayName } as const;
+};
+
+const validateProfilePrivacy = (
+  value: Record<string, unknown>,
+): ProfilePrivacy | null => {
+  const privacy = {
+    profileVisibility: value.profileVisibility,
+    friendListVisibility: value.friendListVisibility,
+    mutualFriendsVisibility: value.mutualFriendsVisibility,
+    onlineStatusVisibility: value.onlineStatusVisibility,
+  };
+  return (privacy.profileVisibility === "public" ||
+    privacy.profileVisibility === "friends" ||
+    privacy.profileVisibility === "private") &&
+    (privacy.friendListVisibility === "everyone" ||
+      privacy.friendListVisibility === "friends" ||
+      privacy.friendListVisibility === "only_me") &&
+    (privacy.mutualFriendsVisibility === "everyone" ||
+      privacy.mutualFriendsVisibility === "friends" ||
+      privacy.mutualFriendsVisibility === "only_me") &&
+    (privacy.onlineStatusVisibility === "everyone" ||
+      privacy.onlineStatusVisibility === "friends" ||
+      privacy.onlineStatusVisibility === "nobody")
+    ? (privacy as ProfilePrivacy)
+    : null;
 };
 
 const validateProfileLinks = (value: unknown) => {
@@ -1205,7 +1242,60 @@ app.put("/api/settings/password", requireAuth, async (context) => {
 
 app.get("/api/profile", requireAuth, async (context) => {
   const user = context.get("user");
-  return context.json({ user, links: await getProfileLinks(user.id) });
+  const profile = await getProfileByUsername(user.id, user.username);
+  return context.json({ user, profile, links: await getProfileLinks(user.id) });
+});
+
+app.get("/api/profiles/by-username/:username", requireAuth, async (context) => {
+  const username = (context.req.param("username") ?? "").trim();
+  if (!username || username.length > 50)
+    return context.json({ error: "Profile was not found." }, 404);
+  const profile = await getProfileByUsername(context.get("user").id, username);
+  if (!profile) return context.json({ error: "Profile was not found." }, 404);
+  const settings = await getUserSettings(profile.id);
+  const online =
+    profile.canViewOnline &&
+    settings.showOnlineStatus &&
+    settings.presenceStatus !== "invisible" &&
+    (connectionsByUser.get(profile.id)?.size ?? 0) > 0;
+  const { canViewOnline: _canViewOnline, ...safeProfile } = profile;
+  return context.json({
+    profile: {
+      ...safeProfile,
+      online,
+      status: online ? settings.presenceStatus : "offline",
+      customStatus: online ? settings.customStatus : "",
+    },
+  });
+});
+
+app.get(
+  "/api/profiles/by-username/:username/friends",
+  requireAuth,
+  async (context) => {
+    const username = (context.req.param("username") ?? "").trim();
+    const friends = await getVisibleProfileFriends(
+      context.get("user").id,
+      username,
+    );
+    return friends
+      ? context.json({ friends })
+      : context.json({ error: "Friend list is private." }, 403);
+  },
+);
+
+app.put("/api/profile/privacy", requireAuth, async (context) => {
+  const value = await readJson(context);
+  const privacy = value ? validateProfilePrivacy(value) : null;
+  if (!privacy)
+    return context.json({ error: "Invalid profile privacy settings." }, 400);
+  const userId = context.get("user").id;
+  const savedPrivacy = await updateProfilePrivacy(userId, privacy);
+  await chatStatus.settingsChanged(userId);
+  return context.json({
+    privacy: savedPrivacy,
+    message: "Privacy settings updated.",
+  });
 });
 
 app.get("/api/profiles/:userId", requireAuth, async (context) => {
@@ -1254,6 +1344,7 @@ app.put("/api/profile", requireAuth, async (context) => {
       profile.username,
       profile.email,
       profile.bio,
+      profile.displayName,
     );
     if (links) await replaceProfileLinks(currentUser.id, links);
     return context.json({
@@ -1354,28 +1445,30 @@ app.get("/api/friends", requireAuth, async (context) => {
       getFriends(userId),
       getUnreadCounts(userId),
     ]);
+    const preferences = await getPresencePreferences(
+      friends.map((friend) => friend.id),
+    );
     const unread = new Map(
       counts.map((count) => [count.friendId, count.unreadCount]),
     );
-    const visibleFriends = await Promise.all(
-      friends.map(async (friend) => {
-        const settings = await getUserSettings(friend.id);
-        const online =
-          (connectionsByUser.get(friend.id)?.size ?? 0) > 0 &&
-          settings.showOnlineStatus &&
-          settings.presenceStatus !== "invisible";
-        return {
-          ...friend,
-          unreadCount: unread.get(friend.id) ?? 0,
-          online,
-          status:
-            online && settings.presenceStatus !== "invisible"
-              ? settings.presenceStatus
-              : "offline",
-          customStatus: online ? settings.customStatus : "",
-        };
-      }),
-    );
+    const visibleFriends = friends.map((friend) => {
+      const settings = preferences.get(friend.id)!;
+      const online =
+        (connectionsByUser.get(friend.id)?.size ?? 0) > 0 &&
+        settings.showOnlineStatus &&
+        settings.onlineStatusVisibility !== "nobody" &&
+        settings.presenceStatus !== "invisible";
+      return {
+        ...friend,
+        unreadCount: unread.get(friend.id) ?? 0,
+        online,
+        status:
+          online && settings.presenceStatus !== "invisible"
+            ? settings.presenceStatus
+            : "offline",
+        customStatus: online ? settings.customStatus : "",
+      };
+    });
     return context.json({
       friends: visibleFriends,
     });
@@ -1423,6 +1516,31 @@ app.get("/api/friend-requests", requireAuth, async (context) => {
   } catch (error) {
     console.error("Failed to load friend requests", error);
     return context.json({ error: "Friend requests could not be loaded." }, 500);
+  }
+});
+
+app.get("/api/friend-requests/sent", requireAuth, async (context) => {
+  try {
+    return context.json({
+      requests: await getSentFriendRequests(context.get("user").id),
+    });
+  } catch (error) {
+    console.error("Failed to load sent friend requests", error);
+    return context.json({ error: "Sent requests could not be loaded." }, 500);
+  }
+});
+
+app.get("/api/friends/suggestions", requireAuth, async (context) => {
+  try {
+    return context.json({
+      users: await getFriendSuggestions(context.get("user").id),
+    });
+  } catch (error) {
+    console.error("Failed to load friend suggestions", error);
+    return context.json(
+      { error: "Friend suggestions could not be loaded." },
+      500,
+    );
   }
 });
 
@@ -1508,6 +1626,27 @@ app.put("/api/friend-requests/:requestId", requireAuth, async (context) => {
   } catch (error) {
     console.error("Failed to respond to friend request", error);
     return context.json({ error: "Friend request could not be updated." }, 500);
+  }
+});
+
+app.delete("/api/friend-requests/:requestId", requireAuth, async (context) => {
+  const requestId = context.req.param("requestId") ?? "";
+  if (!/^\d+$/.test(requestId))
+    return context.json({ error: "Invalid friend request." }, 400);
+  try {
+    const cancelled = await cancelFriendRequest(
+      requestId,
+      context.get("user").id,
+    );
+    return cancelled
+      ? context.json({ message: "Friend request cancelled." })
+      : context.json({ error: "Pending sent request was not found." }, 404);
+  } catch (error) {
+    console.error("Failed to cancel friend request", error);
+    return context.json(
+      { error: "Friend request could not be cancelled." },
+      500,
+    );
   }
 });
 

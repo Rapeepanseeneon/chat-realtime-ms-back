@@ -2,6 +2,8 @@ import type { WSContext } from "hono/ws";
 import {
   areFriends,
   getFriends,
+  getProfilePrivacy,
+  getPresencePreferences,
   getUserSettings,
   getUnreadCounts,
   markMessagesRead,
@@ -77,13 +79,15 @@ export class ChatStatusTracker {
   }
 
   private async publishPresence(userId: string) {
-    const [friends, settings] = await Promise.all([
+    const [friends, settings, privacy] = await Promise.all([
       getFriends(userId),
       getUserSettings(userId),
+      getProfilePrivacy(userId),
     ]);
     const publiclyOnline =
       this.transport.isOnline(userId) &&
       settings.showOnlineStatus &&
+      privacy.onlineStatusVisibility !== "nobody" &&
       settings.presenceStatus !== "invisible";
     // Recheck after the query so a slow open notification cannot overwrite close.
     const event: StatusServerEvent = {
@@ -147,13 +151,8 @@ export class ChatStatusTracker {
       getFriends(userId),
       getUnreadCounts(userId),
     ]);
-    const friendSettings = new Map(
-      await Promise.all(
-        friends.map(
-          async (friend) =>
-            [friend.id, await getUserSettings(friend.id)] as const,
-        ),
-      ),
+    const friendSettings = await getPresencePreferences(
+      friends.map((friend) => friend.id),
     );
     const countByFriend = new Map(
       counts.map((count) => [count.friendId, count.unreadCount]),
@@ -166,6 +165,7 @@ export class ChatStatusTracker {
         const publiclyOnline =
           this.transport.isOnline(friend.id) &&
           settings.showOnlineStatus &&
+          settings.onlineStatusVisibility !== "nobody" &&
           settings.presenceStatus !== "invisible";
         return {
           id: friend.id,
