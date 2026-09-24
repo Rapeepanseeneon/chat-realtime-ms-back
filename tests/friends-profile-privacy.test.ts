@@ -1,15 +1,21 @@
 import { expect, test } from "bun:test";
 import { SQL } from "bun";
+import {
+  getOptionalIntegrationTestEnvironment,
+  verifyTestBackend,
+} from "../src/testing/test-environment";
 
-const api = Bun.env.CHAT_TEST_API_URL?.replace(/\/$/, "");
+const integration = getOptionalIntegrationTestEnvironment();
+const api = integration?.apiUrl;
 const origin = (Bun.env.FRONTEND_URL ?? "http://localhost:3000").split(",")[0]!;
 
 (api ? test : test.skip)(
   "friends page APIs enforce request ownership, profile privacy and real mutual suggestions",
   async () => {
-    if (!api || !Bun.env.DATABASE_URL)
+    if (!api || !integration)
       throw new Error("Missing integration environment");
-    const database = new SQL(Bun.env.DATABASE_URL, { max: 1 });
+    await verifyTestBackend(integration);
+    const database = new SQL(integration.databaseUrl, { max: 1 });
     const suffix = `${Date.now()}${Math.random().toString(16).slice(2)}`;
     const users = ["A", "B", "C", "D"].map((letter) => ({
       username:

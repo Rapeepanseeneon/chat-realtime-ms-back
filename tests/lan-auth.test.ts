@@ -1,7 +1,12 @@
 import { expect, test } from "bun:test";
 import { SQL } from "bun";
+import {
+  getOptionalIntegrationTestEnvironment,
+  verifyTestBackend,
+} from "../src/testing/test-environment";
 
-const api = Bun.env.CHAT_TEST_API_URL;
+const integration = getOptionalIntegrationTestEnvironment();
+const api = integration?.apiUrl;
 const origins = (Bun.env.CHAT_TEST_FRONTEND_ORIGINS ?? "")
   .split(",")
   .map((origin) => origin.trim())
@@ -10,9 +15,9 @@ const origins = (Bun.env.CHAT_TEST_FRONTEND_ORIGINS ?? "")
 (api && origins.length ? test : test.skip)(
   "localhost and LAN origins can register, login, keep cookies and authenticate WebSockets",
   async () => {
-    if (!api || !Bun.env.DATABASE_URL)
-      throw Error("Missing integration environment");
-    const db = new SQL(Bun.env.DATABASE_URL, { max: 1 });
+    if (!api || !integration) throw Error("Missing integration environment");
+    await verifyTestBackend(integration);
+    const db = new SQL(integration.databaseUrl, { max: 1 });
     const suffix = `${Date.now()}${Math.random().toString(16).slice(2)}`;
     const emails: string[] = [];
     const sockets: WebSocket[] = [];

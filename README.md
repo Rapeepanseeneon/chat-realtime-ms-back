@@ -34,6 +34,34 @@ On startup, the backend uses `DATABASE_URL` to connect to PostgreSQL and creates
 the `users`, `sessions`, and `messages` tables and their indexes if needed.
 Passwords are hashed with Argon2id and session cookies are HttpOnly.
 
+## Isolated integration tests
+
+Integration tests never fall back to `DATABASE_URL`. Create a dedicated test
+database whose name ends in `_test` or `-test` (for example,
+`pb_messenger_test`) and set `TEST_DATABASE_URL`. Production-like names are
+rejected even when they have a test suffix.
+
+Create the database manually with an authorized PostgreSQL account:
+
+```sql
+CREATE DATABASE pb_messenger_test OWNER your_pb_database_user;
+```
+
+Configure a separate backend port, then start the guarded test backend:
+
+```powershell
+$env:TEST_DATABASE_URL = "postgresql://username:password@localhost:5432/pb_messenger_test"
+$env:TEST_BACKEND_PORT = "3101"
+$env:CHAT_TEST_API_URL = "http://localhost:3101"
+bun run test:integration:backend
+```
+
+In a second terminal with the same three variables, run `bun run
+test:integration`. The test backend exposes an identity marker on `/health`;
+integration suites refuse to mutate data unless both the database guard and
+that marker pass. The normal development backend continues to use
+`DATABASE_URL` and port 3001.
+
 ## Checks
 
 ```bash

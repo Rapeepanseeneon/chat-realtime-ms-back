@@ -98,6 +98,7 @@ import {
   PayloadTooLargeError,
   readJsonObject,
 } from "./security/request-limits";
+import { assertTestBackendRuntime } from "./testing/test-environment";
 
 const MAX_MESSAGE_LENGTH = 1_000;
 const MIN_PASSWORD_LENGTH = 8;
@@ -1068,6 +1069,8 @@ const chatStatus = new ChatStatusTracker({
   sendToClient: sendJson,
 });
 
+const testBackendMode = Bun.env.PB_TEST_BACKEND === "1";
+if (testBackendMode) assertTestBackendRuntime();
 await initializeDatabase();
 const publishReleasedGhost = async (
   message: PrivateMessage,
@@ -1148,9 +1151,13 @@ app.use("/api/*", requireTrustedOrigin);
 app.get("/", (context) =>
   context.json({ service: "chat-realtime-ms-back", websocket: "/ws" }),
 );
-app.get("/health", (context) =>
-  context.json({ status: "ok", connectedClients: authenticatedClients.size }),
-);
+app.get("/health", (context) => {
+  if (testBackendMode) context.header("X-Pb-Test-Backend", "1");
+  return context.json({
+    status: "ok",
+    connectedClients: authenticatedClients.size,
+  });
+});
 app.get("/uploads/avatars/:filename", async (context) => {
   const filename = context.req.param("filename");
   if (!/^[a-zA-Z0-9-]+\.(?:jpg|png|webp)$/.test(filename))

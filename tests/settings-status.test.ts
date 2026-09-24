@@ -1,7 +1,12 @@
 import { expect, test } from "bun:test";
 import { SQL } from "bun";
+import {
+  getOptionalIntegrationTestEnvironment,
+  verifyTestBackend,
+} from "../src/testing/test-environment";
 
-const api = Bun.env.CHAT_TEST_API_URL?.replace(/\/$/, "");
+const integration = getOptionalIntegrationTestEnvironment();
+const api = integration?.apiUrl;
 const origin = (Bun.env.FRONTEND_URL ?? "http://localhost:3000").replace(
   /\/$/,
   "",
@@ -10,9 +15,10 @@ const origin = (Bun.env.FRONTEND_URL ?? "http://localhost:3000").replace(
 (api ? test : test.skip)(
   "settings enforce presence, typing, read receipt and password privacy",
   async () => {
-    if (!api || !Bun.env.DATABASE_URL)
+    if (!api || !integration)
       throw new Error("Missing integration environment");
-    const database = new SQL(Bun.env.DATABASE_URL, { max: 1 });
+    await verifyTestBackend(integration);
+    const database = new SQL(integration.databaseUrl, { max: 1 });
     const suffix = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const oldPassword = "Settings-Test-42";
     const newPassword = "Settings-Test-84";

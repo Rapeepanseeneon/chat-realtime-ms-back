@@ -1,7 +1,12 @@
 import { expect, test } from "bun:test";
 import { SQL } from "bun";
+import {
+  getOptionalIntegrationTestEnvironment,
+  verifyTestBackend,
+} from "../src/testing/test-environment";
 
-const api = Bun.env.CHAT_TEST_API_URL?.replace(/\/$/, "");
+const integration = getOptionalIntegrationTestEnvironment();
+const api = integration?.apiUrl;
 const origin = (Bun.env.FRONTEND_URL ?? "http://localhost:3000")
   .split(",")[0]!
   .trim();
@@ -9,9 +14,10 @@ const origin = (Bun.env.FRONTEND_URL ?? "http://localhost:3000")
 (api ? test : test.skip)(
   "Phase B perimeter limits sessions, privacy, legacy realtime and oversized input",
   async () => {
-    if (!api || !Bun.env.DATABASE_URL)
+    if (!api || !integration)
       throw new Error("Missing integration environment");
-    const db = new SQL(Bun.env.DATABASE_URL, { max: 1 });
+    await verifyTestBackend(integration);
+    const db = new SQL(integration.databaseUrl, { max: 1 });
     const suffix = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const password = "Security-Perimeter-42";
     const nextPassword = "Security-Perimeter-84";

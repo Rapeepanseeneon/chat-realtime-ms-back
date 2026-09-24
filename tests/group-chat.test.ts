@@ -1,13 +1,18 @@
 import { expect, test } from "bun:test";
 import { SQL } from "bun";
-const api = Bun.env.CHAT_TEST_API_URL,
+import {
+  getOptionalIntegrationTestEnvironment,
+  verifyTestBackend,
+} from "../src/testing/test-environment";
+const integration = getOptionalIntegrationTestEnvironment();
+const api = integration?.apiUrl,
   origin = Bun.env.FRONTEND_URL ?? "http://localhost:3000";
 (api ? test : test.skip)(
   "group create, permissions, realtime, reply/edit/delete, unread, typing and membership",
   async () => {
-    if (!api || !Bun.env.DATABASE_URL)
-      throw Error("Missing integration environment");
-    const db = new SQL(Bun.env.DATABASE_URL, { max: 1 });
+    if (!api || !integration) throw Error("Missing integration environment");
+    await verifyTestBackend(integration);
+    const db = new SQL(integration.databaseUrl, { max: 1 });
     const suffix = Date.now() + Math.random().toString(16).slice(2);
     const users = ["A", "B", "C", "D", "E"].map((x) => ({
       username: "Group" + x + suffix,

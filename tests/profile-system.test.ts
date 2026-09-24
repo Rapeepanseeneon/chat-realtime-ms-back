@@ -1,15 +1,21 @@
 import { expect, test } from "bun:test";
 import { SQL } from "bun";
+import {
+  getOptionalIntegrationTestEnvironment,
+  verifyTestBackend,
+} from "../src/testing/test-environment";
 
-const api = Bun.env.CHAT_TEST_API_URL;
+const integration = getOptionalIntegrationTestEnvironment();
+const api = integration?.apiUrl;
 const origin = Bun.env.FRONTEND_URL ?? "http://localhost:3000";
 
 (api ? test : test.skip)(
   "profile privacy, links, avatar lifecycle and per-user favorites",
   async () => {
-    if (!api || !Bun.env.DATABASE_URL)
+    if (!api || !integration)
       throw new Error("Missing integration environment");
-    const db = new SQL(Bun.env.DATABASE_URL, { max: 1 });
+    await verifyTestBackend(integration);
+    const db = new SQL(integration.databaseUrl, { max: 1 });
     const suffix = `${Date.now()}${Math.random().toString(16).slice(2)}`;
     const users = ["A", "B", "C"].map((letter) => ({
       username: `Profile${letter}${suffix}`,

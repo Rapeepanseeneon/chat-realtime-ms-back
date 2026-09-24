@@ -1,17 +1,22 @@
 import { expect, test } from "bun:test";
 import { SQL } from "bun";
 import { createServer } from "node:net";
-import { publishPendingGhosts, releaseDueGhosts } from "../src/database";
+import { requireTestDatabase } from "../src/testing/test-environment";
 
 // Opt-in integration test. A disposable PostgreSQL schema and real backend
 // process keep crash/restart tests away from existing users and the dev worker.
-(Bun.env.CHAT_TEST_API_URL ? test : test.skip)(
+const testDatabase = Bun.env.TEST_DATABASE_URL ? requireTestDatabase() : null;
+(testDatabase ? test : test.skip)(
   "scheduled ghost recovery, concurrent release, offline history and error retry",
   async () => {
-    const admin = new SQL(Bun.env.DATABASE_URL!, { max: 1 });
+    if (!testDatabase) throw new Error("Missing TEST_DATABASE_URL");
+    Bun.env.DATABASE_URL = testDatabase.url;
+    const { publishPendingGhosts, releaseDueGhosts } =
+      await import("../src/database");
+    const admin = new SQL(testDatabase.url, { max: 1 });
     const schema =
       "ghost_reliability_" + crypto.randomUUID().replaceAll("-", "");
-    const url = new URL(Bun.env.DATABASE_URL!);
+    const url = new URL(testDatabase.url);
     url.searchParams.set("options", "-c search_path=" + schema);
     const db = new SQL(url.toString(), { max: 5 });
     const reservation = createServer();
@@ -50,8 +55,11 @@ import { publishPendingGhosts, releaseDueGhosts } from "../src/database";
         env: {
           ...Bun.env,
           DATABASE_URL: url.toString(),
+          TEST_DATABASE_URL: testDatabase.url,
           DATABASE_POOL_SIZE: "1",
           PORT: String(port),
+          TEST_BACKEND_PORT: String(port),
+          PB_TEST_BACKEND: "1",
           DEV_HTTPS: "false",
           COOKIE_SECURE: "false",
           FRONTEND_URL: origin,
@@ -65,11 +73,11 @@ import { publishPendingGhosts, releaseDueGhosts } from "../src/database";
         try {
           return (
             (
-              await fetch(api + "/api/auth/me", {
+              await fetch(api + "/health", {
                 signal: AbortSignal.timeout(250),
-                headers: { Connection: "close", Origin: origin },
+                headers: { Connection: "close" },
               })
-            ).status === 401
+            ).headers.get("x-pb-test-backend") === "1"
           );
         } catch {
           return false;

@@ -1,9 +1,14 @@
 import { expect, test } from "bun:test";
 import { SQL } from "bun";
+import {
+  getOptionalIntegrationTestEnvironment,
+  verifyTestBackend,
+} from "../src/testing/test-environment";
 
 // Opt-in integration test against a running backend using its DATABASE_URL.
 // Only uniquely named test accounts are deleted; FK cascades remove their data.
-const baseUrl = Bun.env.CHAT_TEST_API_URL?.replace(/\/$/, "");
+const integration = getOptionalIntegrationTestEnvironment();
+const baseUrl = integration?.apiUrl;
 const origin = (Bun.env.FRONTEND_URL ?? "http://localhost:3000").replace(
   /\/$/,
   "",
@@ -21,10 +26,10 @@ integrationTest(
       id: "",
       cookie: "",
     }));
-    const databaseUrl = Bun.env.DATABASE_URL;
-    if (!databaseUrl || !baseUrl)
+    if (!integration || !baseUrl)
       throw new Error("Integration environment is not configured");
-    const database = new SQL(databaseUrl, { max: 1 });
+    await verifyTestBackend(integration);
+    const database = new SQL(integration.databaseUrl, { max: 1 });
     type Event = { type: string; [key: string]: unknown };
     type Client = { socket: WebSocket; events: Event[] };
     const clients: Client[] = [];

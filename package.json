@@ -7,6 +7,9 @@
   "scripts": {
     "dev": "bun run --hot src/index.ts",
     "start": "bun run src/index.ts",
+    "test:unit": "bun test tests/test-database-safety.test.ts tests/attachment-storage.test.ts tests/security-perimeter.test.ts",
+    "test:integration:backend": "bun run scripts/start-test-backend.ts",
+    "test:integration": "bun test",
     "build": "bun build ./src/index.ts --target=bun --outdir=dist",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
