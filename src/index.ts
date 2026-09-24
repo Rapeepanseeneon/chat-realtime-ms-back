@@ -2,7 +2,7 @@ import { Hono, type Context, type Next } from "hono";
 import type { SQL } from "bun";
 import { mkdir, unlink } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import { upgradeWebSocket, websocket } from "hono/bun";
+import { getConnInfo, upgradeWebSocket, websocket } from "hono/bun";
 import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { WSContext } from "hono/ws";
@@ -50,7 +50,7 @@ import {
   setFavoriteFriend,
   getUserSettings,
   updateUserSettings,
-  updateUserPassword,
+  updatePasswordAndReplaceSessions,
   createGroup,
   getGroups,
   getGroupInfo,
@@ -90,6 +90,14 @@ import {
   validateUpload,
   writeAttachment,
 } from "./attachment-storage";
+import { RateLimiter, type RateLimitDecision } from "./security/rate-limit";
+import {
+  assertRequestBodyWithin,
+  MAX_JSON_BODY_BYTES,
+  MULTIPART_OVERHEAD_BYTES,
+  PayloadTooLargeError,
+  readJsonObject,
+} from "./security/request-limits";
 
 const MAX_MESSAGE_LENGTH = 1_000;
 const MIN_PASSWORD_LENGTH = 8;
@@ -98,6 +106,10 @@ const MAX_BIO_LENGTH = 150;
 const MAX_AVATAR_BYTES = 5 * 1024 * 1024;
 const SESSION_DURATION_SECONDS = 60 * 60 * 24 * 7;
 const SESSION_COOKIE = "pb_session";
+const MAX_HTTP_BODY_BYTES = MAX_FILE_BYTES + MULTIPART_OVERHEAD_BYTES;
+const MAX_WEBSOCKET_PAYLOAD_BYTES = 96 * 1024;
+const WEBSOCKET_BACKPRESSURE_BYTES = 512 * 1024;
+const MAX_QUEUED_CLIENT_EVENTS = 32;
 const normalizeOrigin = (value: string) => {
   try {
     const url = new URL(value.trim());
@@ -133,6 +145,8 @@ const secureCookies =
   devHttpsEnabled ||
   Bun.env.COOKIE_SECURE === "true" ||
   (Bun.env.COOKIE_SECURE !== "false" && Bun.env.NODE_ENV === "production");
+const trustProxy = Bun.env.TRUST_PROXY === "true";
+const legacyGlobalChatEnabled = Bun.env.ENABLE_LEGACY_GLOBAL_CHAT === "true";
 
 type Variables = { user: PublicUser };
 type CallIceCandidate = {
@@ -237,7 +251,9 @@ type ServerMessage =
 const app = new Hono<{ Variables: Variables }>();
 const connectionsByUser = new Map<string, Set<WSContext>>();
 const authenticatedClients = new Map<unknown, PublicUser>();
-const clientEventQueues = new Map<unknown, Promise<void>>();
+type ClientEventQueue = { tail: Promise<void>; pending: number };
+const clientEventQueues = new Map<unknown, ClientEventQueue>();
+const connectionIds = new Map<unknown, string>();
 const groupTyping = new Map<
   unknown,
   Map<string, ReturnType<typeof setTimeout>>
@@ -253,11 +269,131 @@ type ActiveCall = {
 };
 const activeCalls = new Map<string, ActiveCall>();
 const activeCallByUser = new Map<string, string>();
+
+const rateLimits = {
+  loginIp: new RateLimiter({
+    capacity: 60,
+    refillWindowMs: 5 * 60_000,
+    cooldownMs: 5 * 60_000,
+  }),
+  loginAccount: new RateLimiter({
+    capacity: 8,
+    refillWindowMs: 5 * 60_000,
+    cooldownMs: 10 * 60_000,
+  }),
+  registerIp: new RateLimiter({
+    capacity: 60,
+    refillWindowMs: 60 * 60_000,
+    cooldownMs: 30 * 60_000,
+  }),
+  registerIdentity: new RateLimiter({
+    capacity: 3,
+    refillWindowMs: 60 * 60_000,
+    cooldownMs: 30 * 60_000,
+  }),
+  search: new RateLimiter({
+    capacity: 40,
+    refillWindowMs: 60_000,
+    cooldownMs: 60_000,
+  }),
+  friendRequest: new RateLimiter({
+    capacity: 12,
+    refillWindowMs: 5 * 60_000,
+    cooldownMs: 5 * 60_000,
+  }),
+  upload: new RateLimiter({
+    capacity: 12,
+    refillWindowMs: 5 * 60_000,
+    cooldownMs: 5 * 60_000,
+  }),
+  settings: new RateLimiter({
+    capacity: 20,
+    refillWindowMs: 60_000,
+    cooldownMs: 60_000,
+  }),
+  wsConnection: new RateLimiter({
+    capacity: 120,
+    refillWindowMs: 10_000,
+    cooldownMs: 15_000,
+  }),
+  wsMalformed: new RateLimiter({
+    capacity: 5,
+    refillWindowMs: 30_000,
+    cooldownMs: 60_000,
+  }),
+  wsMessage: new RateLimiter({
+    capacity: 40,
+    refillWindowMs: 10_000,
+    cooldownMs: 30_000,
+  }),
+  wsTyping: new RateLimiter({
+    capacity: 12,
+    refillWindowMs: 5_000,
+    cooldownMs: 15_000,
+  }),
+  wsPresence: new RateLimiter({
+    capacity: 5,
+    refillWindowMs: 10_000,
+    cooldownMs: 30_000,
+  }),
+  wsCallOffer: new RateLimiter({
+    capacity: 5,
+    refillWindowMs: 60_000,
+    cooldownMs: 5 * 60_000,
+  }),
+  wsCallSignal: new RateLimiter({
+    capacity: 180,
+    refillWindowMs: 60_000,
+    cooldownMs: 60_000,
+  }),
+};
 const getClientKey = (client: WSContext): unknown => client.raw ?? client;
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
 const hashSessionToken = (token: string) =>
   new Bun.CryptoHasher("sha256").update(token).digest("hex");
+
+const hashRateKey = (value: string) =>
+  new Bun.CryptoHasher("sha256").update(value).digest("hex");
+
+const getRequestAddress = (context: Context) => {
+  if (trustProxy) {
+    const forwarded = context.req
+      .header("X-Forwarded-For")
+      ?.split(",", 1)[0]
+      ?.trim();
+    if (forwarded) return forwarded;
+  }
+  try {
+    return getConnInfo(context).remote.address ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+};
+
+const rateLimitResponse = (
+  context: Context,
+  decision: RateLimitDecision,
+  message = "Too many requests. Please wait and try again.",
+) => {
+  context.header(
+    "Retry-After",
+    String(Math.max(1, Math.ceil(decision.retryAfterMs / 1000))),
+  );
+  return context.json({ error: message, code: "RATE_LIMITED" }, 429);
+};
+
+const enforceRateLimit = (
+  context: Context,
+  limiter: RateLimiter,
+  key: string,
+  message?: string,
+) => {
+  const decision = limiter.consume(key);
+  return decision.allowed
+    ? null
+    : rateLimitResponse(context, decision, message);
+};
 
 const createSessionToken = () => {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -269,12 +405,7 @@ const createSessionToken = () => {
 const readJson = async (
   context: Context,
 ): Promise<Record<string, unknown> | null> => {
-  try {
-    const value: unknown = await context.req.json();
-    return isRecord(value) ? value : null;
-  } catch {
-    return null;
-  }
+  return readJsonObject(context.req.raw, MAX_JSON_BODY_BYTES);
 };
 
 const validateProfile = (value: Record<string, unknown>) => {
@@ -401,7 +532,7 @@ const requireAuth = async (
 const requireTrustedOrigin = async (context: Context, next: Next) => {
   if (["POST", "PUT", "PATCH", "DELETE"].includes(context.req.method)) {
     const origin = context.req.header("Origin");
-    if (origin && !isTrustedFrontendOrigin(origin)) {
+    if (!isTrustedFrontendOrigin(origin)) {
       return context.json(
         { error: "This request origin is not allowed." },
         403,
@@ -413,7 +544,7 @@ const requireTrustedOrigin = async (context: Context, next: Next) => {
 
 const requireTrustedWebSocketOrigin = async (context: Context, next: Next) => {
   const origin = context.req.header("Origin");
-  if (origin && !isTrustedFrontendOrigin(origin))
+  if (!isTrustedFrontendOrigin(origin))
     return context.json(
       { error: "This WebSocket origin is not allowed." },
       403,
@@ -633,6 +764,15 @@ const parseClientMessage = (rawValue: unknown): ClientMessage | null => {
 
 const sendJson = (client: WSContext, message: ServerMessage) => {
   try {
+    const raw = client.raw as { getBufferedAmount?: () => number } | undefined;
+    if (
+      raw?.getBufferedAmount &&
+      raw.getBufferedAmount() >= WEBSOCKET_BACKPRESSURE_BYTES
+    ) {
+      client.close(1013, "Realtime connection is overloaded");
+      removeConnection(client);
+      return;
+    }
     client.send(JSON.stringify(message));
   } catch {
     removeConnection(client);
@@ -707,6 +847,12 @@ const removeConnection = (client: WSContext) => {
   if (user) endCallsForClient(key, user.id);
   authenticatedClients.delete(key);
   clientEventQueues.delete(key);
+  const connectionId = connectionIds.get(key);
+  if (connectionId) {
+    rateLimits.wsConnection.delete(`connection:${connectionId}`);
+    rateLimits.wsMalformed.delete(`malformed:${connectionId}`);
+  }
+  connectionIds.delete(key);
   if (!user) return;
   const connections = connectionsByUser.get(user.id);
   // Hono creates a fresh WSContext wrapper for each callback; match the raw socket.
@@ -853,6 +999,35 @@ const isCallClientMessage = (
   message: ClientMessage,
 ): message is CallClientMessage => message.type.startsWith("call.");
 
+const websocketEventLimit = (message: ClientMessage, userId: string) => {
+  if (message.type === "call.offer")
+    return rateLimits.wsCallOffer.consume(`call-offer:${userId}`);
+  if (message.type.startsWith("call."))
+    return rateLimits.wsCallSignal.consume(`call-signal:${userId}`);
+  if (
+    message.type === "typing.start" ||
+    message.type === "typing.stop" ||
+    message.type === "group.typing.start" ||
+    message.type === "group.typing.stop"
+  )
+    return rateLimits.wsTyping.consume(`typing:${userId}`);
+  if (message.type === "chat.sync")
+    return rateLimits.wsPresence.consume(`presence:${userId}`);
+  return rateLimits.wsMessage.consume(`message:${userId}`);
+};
+
+const sendWebSocketRateLimit = (
+  client: WSContext,
+  decision: RateLimitDecision,
+) =>
+  sendJson(client, {
+    type: "error",
+    data: {
+      code: "RATE_LIMITED",
+      message: `Too many realtime actions. Try again in ${Math.max(1, Math.ceil(decision.retryAfterMs / 1000))} seconds.`,
+    },
+  });
+
 const broadcastToGroup = async (
   groupId: string,
   message: ServerMessage,
@@ -946,6 +1121,19 @@ const saveAttachmentMessage = async (
   return { scope, message } as const;
 };
 
+app.onError((error, context) => {
+  if (error instanceof PayloadTooLargeError)
+    return context.json(
+      { error: "Request body is too large.", code: "PAYLOAD_TOO_LARGE" },
+      413,
+    );
+  console.error("Unhandled backend request error", error);
+  return context.json(
+    { error: "The request could not be completed.", code: "INTERNAL_ERROR" },
+    500,
+  );
+});
+
 app.use(
   "/api/*",
   cors({
@@ -979,6 +1167,14 @@ app.get("/uploads/avatars/:filename", async (context) => {
 });
 
 app.post("/api/auth/register", async (context) => {
+  const address = getRequestAddress(context);
+  const ipLimited = enforceRateLimit(
+    context,
+    rateLimits.registerIp,
+    `register:ip:${address}`,
+    "Too many registration attempts. Please wait and try again.",
+  );
+  if (ipLimited) return ipLimited;
   const value = await readJson(context);
   if (!value)
     return context.json(
@@ -987,6 +1183,13 @@ app.post("/api/auth/register", async (context) => {
     );
   const profile = validateProfile(value);
   if ("error" in profile) return context.json({ error: profile.error }, 400);
+  const identityLimited = enforceRateLimit(
+    context,
+    rateLimits.registerIdentity,
+    `register:identity:${address}:${hashRateKey(`${profile.username.toLowerCase()}|${profile.email}`)}`,
+    "Too many registration attempts for these details. Please wait and try again.",
+  );
+  if (identityLimited) return identityLimited;
 
   const password = typeof value.password === "string" ? value.password : "";
   const confirmPassword =
@@ -1008,9 +1211,7 @@ app.post("/api/auth/register", async (context) => {
   const conflict = await findConflictingUser(profile.username, profile.email);
   if (conflict)
     return context.json(
-      {
-        error: `${conflict === "username" ? "Username" : "Email"} is already in use.`,
-      },
+      { error: "An account with those details already exists." },
       409,
     );
 
@@ -1044,9 +1245,7 @@ app.post("/api/auth/register", async (context) => {
     );
     if (racedConflict)
       return context.json(
-        {
-          error: `${racedConflict === "username" ? "Username" : "Email"} is already in use.`,
-        },
+        { error: "An account with those details already exists." },
         409,
       );
     return context.json(
@@ -1057,17 +1256,34 @@ app.post("/api/auth/register", async (context) => {
 });
 
 app.post("/api/auth/login", async (context) => {
+  const address = getRequestAddress(context);
+  const ipLimited = enforceRateLimit(
+    context,
+    rateLimits.loginIp,
+    `login:ip:${address}`,
+    "Too many login attempts. Please wait and try again.",
+  );
+  if (ipLimited) return ipLimited;
   const value = await readJson(context);
   const email =
     typeof value?.email === "string" ? value.email.trim().toLowerCase() : "";
   const password = typeof value?.password === "string" ? value.password : "";
   if (!email || !password)
     return context.json({ error: "Email and password are required." }, 400);
+  const loginAccountKey = `login:account:${hashRateKey(email)}`;
+  const accountLimited = enforceRateLimit(
+    context,
+    rateLimits.loginAccount,
+    loginAccountKey,
+    "Too many login attempts. Please wait and try again.",
+  );
+  if (accountLimited) return accountLimited;
 
   const user = await findUserByEmail(email);
   if (!user || !(await Bun.password.verify(password, user.passwordHash))) {
     return context.json({ error: "Email or password is incorrect." }, 401);
   }
+  rateLimits.loginAccount.delete(loginAccountKey);
 
   const token = createSessionToken();
   const expiresAt = new Date(Date.now() + SESSION_DURATION_SECONDS * 1_000);
@@ -1125,6 +1341,13 @@ app.get("/api/settings", requireAuth, async (context) => {
 });
 
 app.put("/api/settings", requireAuth, async (context) => {
+  const userId = context.get("user").id;
+  const limited = enforceRateLimit(
+    context,
+    rateLimits.settings,
+    `settings:${userId}`,
+  );
+  if (limited) return limited;
   const value = await readJson(context);
   if (!value)
     return context.json({ error: "Please provide valid settings." }, 400);
@@ -1143,7 +1366,6 @@ app.put("/api/settings", requireAuth, async (context) => {
       { error: "One or more settings are not supported." },
       400,
     );
-  const userId = context.get("user").id;
   try {
     const current = await getUserSettings(userId);
     const presenceStatus = (value.presenceStatus ??
@@ -1209,6 +1431,13 @@ app.put("/api/settings", requireAuth, async (context) => {
 });
 
 app.put("/api/settings/password", requireAuth, async (context) => {
+  const publicUser = context.get("user");
+  const limited = enforceRateLimit(
+    context,
+    rateLimits.settings,
+    `settings:${publicUser.id}`,
+  );
+  if (limited) return limited;
   const value = await readJson(context);
   const currentPassword =
     typeof value?.currentPassword === "string" ? value.currentPassword : "";
@@ -1230,13 +1459,32 @@ app.put("/api/settings/password", requireAuth, async (context) => {
     );
   if (newPassword !== confirmPassword)
     return context.json({ error: "New passwords do not match." }, 400);
-  const publicUser = context.get("user");
   const user = await findUserByEmail(publicUser.email);
   if (!user || !(await Bun.password.verify(currentPassword, user.passwordHash)))
     return context.json({ error: "Current password is incorrect." }, 401);
   const passwordHash = await Bun.password.hash(newPassword, "argon2id");
-  if (!(await updateUserPassword(user.id, passwordHash)))
+  const token = createSessionToken();
+  const expiresAt = new Date(Date.now() + SESSION_DURATION_SECONDS * 1_000);
+  if (
+    !(await updatePasswordAndReplaceSessions(
+      user.id,
+      passwordHash,
+      hashSessionToken(token),
+      expiresAt,
+    ))
+  )
     return context.json({ error: "Password could not be changed." }, 500);
+  for (const client of [...(connectionsByUser.get(user.id) ?? [])]) {
+    client.close(1008, "Session replaced after password change");
+    removeConnection(client);
+  }
+  setCookie(context, SESSION_COOKIE, token, {
+    httpOnly: true,
+    secure: secureCookies,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: SESSION_DURATION_SECONDS,
+  });
   return context.json({ message: "Password changed successfully." });
 });
 
@@ -1374,9 +1622,25 @@ app.put("/api/profile", requireAuth, async (context) => {
 });
 
 app.post("/api/profile/avatar", requireAuth, async (context) => {
+  const limited = enforceRateLimit(
+    context,
+    rateLimits.upload,
+    `upload:${context.get("user").id}`,
+    "Too many uploads. Please wait and try again.",
+  );
+  if (limited) return limited;
+  await assertRequestBodyWithin(
+    context.req.raw,
+    MAX_AVATAR_BYTES + MULTIPART_OVERHEAD_BYTES,
+  );
+  let form: FormData;
+  try {
+    form = await context.req.formData();
+  } catch {
+    return context.json({ error: "Avatar upload is malformed." }, 400);
+  }
   let uploadedPath: string | null = null;
   try {
-    const form = await context.req.formData();
     const file = form.get("avatar");
     if (
       !(file instanceof File) ||
@@ -1494,6 +1758,13 @@ app.put("/api/friends/:friendId/favorite", requireAuth, async (context) => {
 });
 
 app.get("/api/friends/search", requireAuth, async (context) => {
+  const limited = enforceRateLimit(
+    context,
+    rateLimits.search,
+    `search:${context.get("user").id}`,
+    "Too many searches. Please wait and try again.",
+  );
+  if (limited) return limited;
   const query = (context.req.query("q") ?? "").trim();
   if (!query || query.length > 254) {
     return context.json({ error: "Enter a username or email to search." }, 400);
@@ -1545,6 +1816,13 @@ app.get("/api/friends/suggestions", requireAuth, async (context) => {
 });
 
 app.post("/api/friend-requests", requireAuth, async (context) => {
+  const limited = enforceRateLimit(
+    context,
+    rateLimits.friendRequest,
+    `friend-request:${context.get("user").id}`,
+    "Too many friend requests. Please wait and try again.",
+  );
+  if (limited) return limited;
   const value = await readJson(context);
   const receiverId =
     typeof value?.receiverId === "string" ? value.receiverId.trim() : "";
@@ -1592,6 +1870,13 @@ app.post("/api/friend-requests", requireAuth, async (context) => {
 });
 
 app.put("/api/friend-requests/:requestId", requireAuth, async (context) => {
+  const limited = enforceRateLimit(
+    context,
+    rateLimits.friendRequest,
+    `friend-request:${context.get("user").id}`,
+    "Too many friend request actions. Please wait and try again.",
+  );
+  if (limited) return limited;
   const requestId = context.req.param("requestId") ?? "";
   const value = await readJson(context);
   const action = value?.action;
@@ -1630,6 +1915,13 @@ app.put("/api/friend-requests/:requestId", requireAuth, async (context) => {
 });
 
 app.delete("/api/friend-requests/:requestId", requireAuth, async (context) => {
+  const limited = enforceRateLimit(
+    context,
+    rateLimits.friendRequest,
+    `friend-request:${context.get("user").id}`,
+    "Too many friend request actions. Please wait and try again.",
+  );
+  if (limited) return limited;
   const requestId = context.req.param("requestId") ?? "";
   if (!/^\d+$/.test(requestId))
     return context.json({ error: "Invalid friend request." }, 400);
@@ -1806,6 +2098,11 @@ app.get("/api/messages/:userId", requireAuth, async (context) => {
 });
 
 app.get("/api/messages", requireAuth, async (context) => {
+  if (!legacyGlobalChatEnabled)
+    return context.json(
+      { error: "Legacy global chat is disabled.", code: "FEATURE_DISABLED" },
+      404,
+    );
   try {
     return context.json({ messages: await getRecentMessages() });
   } catch (error) {
@@ -1815,12 +2112,22 @@ app.get("/api/messages", requireAuth, async (context) => {
 });
 
 app.post("/api/attachments", requireAuth, async (context) => {
-  const contentLength = Number(context.req.header("Content-Length") ?? 0);
-  if (contentLength > MAX_FILE_BYTES + 1024 * 1024)
-    return context.json({ error: "Upload is too large." }, 413);
+  const limited = enforceRateLimit(
+    context,
+    rateLimits.upload,
+    `upload:${context.get("user").id}`,
+    "Too many uploads. Please wait and try again.",
+  );
+  if (limited) return limited;
+  await assertRequestBodyWithin(context.req.raw, MAX_HTTP_BODY_BYTES);
+  let form: FormData;
+  try {
+    form = await context.req.formData();
+  } catch {
+    return context.json({ error: "Attachment upload is malformed." }, 400);
+  }
   let storageKey: string | null = null;
   try {
-    const form = await context.req.formData();
     const file = form.get("file");
     const kind = form.get("kind");
     const scope = form.get("scope");
@@ -1875,6 +2182,13 @@ app.post("/api/attachments", requireAuth, async (context) => {
 });
 
 app.post("/api/attachments/location", requireAuth, async (context) => {
+  const limited = enforceRateLimit(
+    context,
+    rateLimits.upload,
+    `upload:${context.get("user").id}`,
+    "Too many shared items. Please wait and try again.",
+  );
+  if (limited) return limited;
   const value = await readJson(context);
   const scope = value?.scope;
   const targetId = value?.targetId;
@@ -1957,8 +2271,10 @@ app.get(
     const user = context.get("user");
     const token = getCookie(context, SESSION_COOKIE);
     const sessionHash = token ? hashSessionToken(token) : null;
+    const connectionId = crypto.randomUUID();
     return {
       onOpen(_event, client) {
+        connectionIds.set(getClientKey(client), connectionId);
         addConnection(user, client);
         console.info(
           `WebSocket connected for user ${user.id} (${authenticatedClients.size} total)`,
@@ -1966,19 +2282,52 @@ app.get(
       },
       onMessage(event, client) {
         const key = getClientKey(client);
-        const queued = clientEventQueues.get(key) ?? Promise.resolve();
-        const task = queued
+        const overall = rateLimits.wsConnection.consume(
+          `connection:${connectionId}`,
+        );
+        if (!overall.allowed) {
+          sendWebSocketRateLimit(client, overall);
+          client.close(1008, "Realtime event rate exceeded");
+          removeConnection(client);
+          return;
+        }
+        const message = parseClientMessage(event.data);
+        if (!message) {
+          const malformed = rateLimits.wsMalformed.consume(
+            `malformed:${connectionId}`,
+          );
+          sendJson(client, {
+            type: "error",
+            data: {
+              code: "INVALID_EVENT",
+              message: `Invalid message. Text must be 1-${MAX_MESSAGE_LENGTH} characters.`,
+            },
+          });
+          if (!malformed.allowed) {
+            client.close(1008, "Too many malformed events");
+            removeConnection(client);
+          }
+          return;
+        }
+        const queue = clientEventQueues.get(key) ?? {
+          tail: Promise.resolve(),
+          pending: 0,
+        };
+        if (queue.pending >= MAX_QUEUED_CLIENT_EVENTS) {
+          sendJson(client, {
+            type: "error",
+            data: {
+              code: "QUEUE_OVERFLOW",
+              message: "Too many realtime actions are waiting to be processed.",
+            },
+          });
+          client.close(1013, "Realtime queue overflow");
+          removeConnection(client);
+          return;
+        }
+        queue.pending += 1;
+        const task = queue.tail
           .then(async () => {
-            const message = parseClientMessage(event.data);
-            if (!message) {
-              sendJson(client, {
-                type: "error",
-                data: {
-                  message: `Invalid message. Text must be 1-${MAX_MESSAGE_LENGTH} characters.`,
-                },
-              });
-              return;
-            }
             const registered = authenticatedClients.get(getClientKey(client));
             const verified =
               registered && sessionHash
@@ -1992,6 +2341,11 @@ app.get(
               });
               client.close(1008, "Session expired");
               removeConnection(client);
+              return;
+            }
+            const eventLimit = websocketEventLimit(message, sender.id);
+            if (!eventLimit.allowed) {
+              sendWebSocketRateLimit(client, eventLimit);
               return;
             }
             if (isCallClientMessage(message)) {
@@ -2148,6 +2502,16 @@ app.get(
               return;
             }
             if (message.type === "message.send.global") {
+              if (!legacyGlobalChatEnabled) {
+                sendJson(client, {
+                  type: "error",
+                  data: {
+                    code: "FEATURE_DISABLED",
+                    message: "Legacy global chat is disabled.",
+                  },
+                });
+                return;
+              }
               try {
                 const storedMessage = await createMessage(
                   sender.username,
@@ -2400,9 +2764,11 @@ app.get(
               },
             });
           });
-        clientEventQueues.set(key, task);
-        void task.then(() => {
-          if (clientEventQueues.get(key) === task)
+        queue.tail = task;
+        clientEventQueues.set(key, queue);
+        void task.finally(() => {
+          queue.pending = Math.max(0, queue.pending - 1);
+          if (queue.pending === 0 && clientEventQueues.get(key) === queue)
             clientEventQueues.delete(key);
         });
       },
@@ -2442,13 +2808,29 @@ const devTls = await (async () => {
 })();
 // Start background work only after binding succeeds. A duplicate development
 // process that fails to bind must not claim scheduled rows without recipients.
+const hardenedWebSocket = {
+  ...websocket,
+  maxPayloadLength: MAX_WEBSOCKET_PAYLOAD_BYTES,
+  backpressureLimit: WEBSOCKET_BACKPRESSURE_BYTES,
+  closeOnBackpressureLimit: true,
+  idleTimeout: 120,
+};
 const createServer = () =>
-  Bun.serve({ port, fetch: app.fetch, websocket, tls: devTls });
+  Bun.serve({
+    port,
+    fetch: app.fetch,
+    websocket: hardenedWebSocket,
+    maxRequestBodySize: MAX_HTTP_BODY_BYTES,
+    tls: devTls,
+  });
 const serverRuntime = globalThis as typeof globalThis & {
   pbMessengerServer?: ReturnType<typeof createServer>;
 };
 if (serverRuntime.pbMessengerServer) {
-  serverRuntime.pbMessengerServer.reload({ fetch: app.fetch, websocket });
+  serverRuntime.pbMessengerServer.reload({
+    fetch: app.fetch,
+    websocket: hardenedWebSocket,
+  });
 } else {
   serverRuntime.pbMessengerServer = createServer();
 }

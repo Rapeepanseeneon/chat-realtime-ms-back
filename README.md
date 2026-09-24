@@ -13,9 +13,22 @@ bun run dev
 ```
 
 The HTTP server runs at `http://localhost:3001` by default. The authenticated
-WebSocket endpoint is `ws://localhost:3001/ws`, and message history is available
-from `GET http://localhost:3001/api/messages`. Set `FRONTEND_URL` to the exact
-frontend origin. In production, use HTTPS and set `COOKIE_SECURE=true`.
+WebSocket endpoint is `ws://localhost:3001/ws`. Set `FRONTEND_URL` to the exact
+frontend origin. In production, use HTTPS and set `COOKIE_SECURE=true`. Set
+`TRUST_PROXY=true` only behind a trusted reverse proxy that overwrites
+`X-Forwarded-For`.
+
+Legacy global chat is disabled by default. `GET /api/messages` and the legacy
+global broadcast payload are available only when
+`ENABLE_LEGACY_GLOBAL_CHAT=true`; private and group chat do not depend on it.
+
+## Discovery and account privacy
+
+Friend search is authenticated and rate-limited. Username search is partial;
+email search requires an exact email address. Search results intentionally omit
+the email address and other private account fields. Exact email remains a
+discoverability key for signed-in users, while registration uses one generic
+conflict response for username/email collisions.
 
 On startup, the backend uses `DATABASE_URL` to connect to PostgreSQL and creates
 the `users`, `sessions`, and `messages` tables and their indexes if needed.

@@ -1308,17 +1308,26 @@ export const updateUserSettings = async (
   return normalizeUserSettings(row);
 };
 
-export const updateUserPassword = async (
+export const updatePasswordAndReplaceSessions = async (
   userId: string,
   passwordHash: string,
-) => {
-  const rows = await database`
-    UPDATE users SET password_hash = ${passwordHash}, updated_at = NOW()
-    WHERE id = ${userId}
-    RETURNING id
-  `;
-  return rows.length === 1;
-};
+  tokenHash: string,
+  expiresAt: Date,
+) =>
+  database.begin(async (transaction) => {
+    const rows = await transaction`
+      UPDATE users SET password_hash = ${passwordHash}, updated_at = NOW()
+      WHERE id = ${userId}
+      RETURNING id
+    `;
+    if (rows.length !== 1) return false;
+    await transaction`DELETE FROM sessions WHERE user_id = ${userId}`;
+    await transaction`
+      INSERT INTO sessions (user_id, token_hash, expires_at)
+      VALUES (${userId}, ${tokenHash}, ${expiresAt})
+    `;
+    return true;
+  });
 
 export const createSession = async (
   userId: string,
@@ -1865,8 +1874,25 @@ export const getGroupInfo = async (
   );
   if (!summary) return null;
   const rows = await database<(GroupMember & { joinedAt: Date | string })[]>`
-    SELECT u.id::text id,u.username,u.avatar_url AS "avatarUrl",u.bio,gm.role,gm.joined_at AS "joinedAt" FROM group_members gm
-    JOIN users u ON u.id=gm.user_id WHERE gm.group_id=${groupId} ORDER BY (gm.role='owner') DESC,gm.joined_at,u.id`;
+    SELECT u.id::text id,u.username,u.avatar_url AS "avatarUrl",
+      CASE
+        WHEN u.id = ${viewerId} THEN u.bio
+        WHEN COALESCE(privacy.profile_visibility, 'friends') = 'public' THEN u.bio
+        WHEN COALESCE(privacy.profile_visibility, 'friends') = 'friends'
+          AND EXISTS(
+            SELECT 1 FROM friend_requests friendship
+            WHERE friendship.status = 'accepted'
+              AND LEAST(friendship.sender_id, friendship.receiver_id) = LEAST(u.id, ${viewerId}::bigint)
+              AND GREATEST(friendship.sender_id, friendship.receiver_id) = GREATEST(u.id, ${viewerId}::bigint)
+          ) THEN u.bio
+        ELSE ''
+      END AS bio,
+      gm.role,gm.joined_at AS "joinedAt"
+    FROM group_members gm
+    JOIN users u ON u.id=gm.user_id
+    LEFT JOIN profile_privacy privacy ON privacy.user_id=u.id
+    WHERE gm.group_id=${groupId}
+    ORDER BY (gm.role='owner') DESC,gm.joined_at,u.id`;
   return {
     ...summary,
     members: rows.map((row) => ({

@@ -52,6 +52,10 @@ import { publishPendingGhosts, releaseDueGhosts } from "../src/database";
           DATABASE_URL: url.toString(),
           DATABASE_POOL_SIZE: "1",
           PORT: String(port),
+          DEV_HTTPS: "false",
+          COOKIE_SECURE: "false",
+          FRONTEND_URL: origin,
+          FRONTEND_URLS: origin,
         },
         stdout: "ignore",
         stderr: "pipe",
@@ -63,7 +67,7 @@ import { publishPendingGhosts, releaseDueGhosts } from "../src/database";
             (
               await fetch(api + "/api/auth/me", {
                 signal: AbortSignal.timeout(250),
-                headers: { Connection: "close" },
+                headers: { Connection: "close", Origin: origin },
               })
             ).status === 401
           );

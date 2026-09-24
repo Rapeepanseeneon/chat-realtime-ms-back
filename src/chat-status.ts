@@ -46,7 +46,7 @@ export type StatusServerEvent =
       throughDeliveryId: string;
       readAt: string;
     }
-  | { type: "error"; data: { message: string } };
+  | { type: "error"; data: { message: string; code?: string } };
 
 type Transport = {
   keyFor: (client: WSContext) => unknown;
