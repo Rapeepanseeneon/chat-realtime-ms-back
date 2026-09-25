@@ -1742,14 +1742,24 @@ export const createGroupMessage = async (
   text: string,
   replyId: string | null,
 ): Promise<GroupMessage | null> => {
-  const [row] = await database<
-    { id: string }[]
-  >`INSERT INTO group_messages(group_id,sender_id,message_text,reply_to_message_id)
-    SELECT ${groupId},${senderId},${text},${replyId}::bigint WHERE EXISTS(SELECT 1 FROM group_members WHERE group_id=${groupId} AND user_id=${senderId})
-    AND (${replyId}::bigint IS NULL OR EXISTS(SELECT 1 FROM group_messages WHERE id=${replyId} AND group_id=${groupId})) RETURNING id::text id`;
-  if (!row) return null;
-  await database`UPDATE groups SET updated_at=clock_timestamp() WHERE id=${groupId}`;
-  return (await selectGroupMessages([row.id]))[0] ?? null;
+  const messageId = await database.begin(async (transaction) => {
+    const [row] = await transaction<
+      { id: string }[]
+    >`INSERT INTO group_messages(group_id,sender_id,message_text,reply_to_message_id)
+      SELECT ${groupId},${senderId},${text},${replyId}::bigint WHERE EXISTS(SELECT 1 FROM group_members WHERE group_id=${groupId} AND user_id=${senderId})
+      AND (${replyId}::bigint IS NULL OR EXISTS(SELECT 1 FROM group_messages WHERE id=${replyId} AND group_id=${groupId})) RETURNING id::text id`;
+    if (!row) return null;
+    const updated = await transaction`
+      UPDATE groups SET updated_at=clock_timestamp() WHERE id=${groupId}
+      RETURNING id
+    `;
+    if (!updated.length)
+      throw new Error("Group activity could not be updated atomically.");
+    return row.id;
+  });
+  return messageId
+    ? ((await selectGroupMessages([messageId]))[0] ?? null)
+    : null;
 };
 
 export const createGroupAttachmentMessage = async (

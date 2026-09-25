@@ -46,6 +46,19 @@ bun run db:migrate
 bun run db:status
 ```
 
+Before applying schema-integrity migrations to an existing database, run the
+read-only preflight. It reports violation counts without changing schema or
+application data:
+
+```powershell
+bun run db:preflight
+# Dedicated test database:
+bun run db:preflight:test
+```
+
+If any category is nonzero, stop and investigate the existing rows. Do not
+delete or silently repair user data merely to make a constraint pass.
+
 The first migration is a baseline of the current Pb schema. For an existing
 database, `db:migrate` first verifies every expected table, column, constraint,
 and index. Only an exact match is adopted into `schema_migrations`; application

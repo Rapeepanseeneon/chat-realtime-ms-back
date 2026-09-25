@@ -51,22 +51,27 @@ const migration = (
 
     try {
       const migrations = await loadMigrations();
-      expect(migrations.map((item) => item.version)).toEqual([1]);
+      expect(migrations.map((item) => item.version)).toEqual([1, 2]);
 
       // Empty schema: build the complete baseline and record it once.
       const empty = await isolated("empty");
       const first = await migrateDatabase(empty, migrations);
       expect(first.ready).toBe(true);
-      expect(first.applied).toEqual([1]);
+      expect(first.applied).toEqual([1, 2]);
       const history = await empty`
         SELECT version::integer AS version, name, checksum
         FROM schema_migrations
       `;
-      expect(history).toHaveLength(1);
+      expect(history).toHaveLength(2);
       expect(history[0]).toMatchObject({
         version: 1,
         name: "baseline",
         checksum: migrations[0]!.checksum,
+      });
+      expect(history[1]).toMatchObject({
+        version: 2,
+        name: "schema_integrity",
+        checksum: migrations[1]!.checksum,
       });
       const second = await migrateDatabase(empty, migrations);
       expect(second).toEqual(first);
@@ -113,7 +118,7 @@ const migration = (
       await migrateDatabase(rollback, migrations);
       const failedSql =
         "CREATE TABLE rollback_probe(id INTEGER); SELECT 1 / 0;";
-      const failed = migration(2, "forced_failure", failedSql);
+      const failed = migration(3, "forced_failure", failedSql);
       await expect(
         migrateDatabase(rollback, [...migrations, failed]),
       ).rejects.toThrow("migration execution failed");
@@ -121,7 +126,7 @@ const migration = (
         { tableExists: boolean; historyCount: number }[]
       >`
         SELECT to_regclass(current_schema() || '.rollback_probe') IS NOT NULL AS "tableExists",
-          (SELECT count(*)::integer FROM schema_migrations WHERE version = 2) AS "historyCount"
+          (SELECT count(*)::integer FROM schema_migrations WHERE version = 3) AS "historyCount"
       `;
       expect(rolledBack).toEqual({ tableExists: false, historyCount: 0 });
       await closeIsolated(rollback);
@@ -137,9 +142,9 @@ const migration = (
       ]);
       expect(results.every((status) => status.ready)).toBe(true);
       const [concurrentHistory] = await concurrentA<{ count: number }[]>`
-        SELECT count(*)::integer AS count FROM schema_migrations WHERE version = 1
+        SELECT count(*)::integer AS count FROM schema_migrations
       `;
-      expect(concurrentHistory?.count).toBe(1);
+      expect(concurrentHistory?.count).toBe(2);
       await closeIsolated(concurrentA);
       await concurrentB.close();
 
@@ -173,7 +178,7 @@ const migration = (
       });
       const startupError = new Response(startup.stderr).text();
       expect(await startup.exited).not.toBe(0);
-      expect(await startupError).toContain("pending migrations: 1");
+      expect(await startupError).toContain("pending migrations: 1, 2");
       await closeIsolated(missing);
     } finally {
       await Promise.allSettled(

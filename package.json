@@ -14,6 +14,8 @@
     "db:migrate:test": "bun run scripts/database-migrations.ts migrate --test",
     "db:status": "bun run scripts/database-migrations.ts status",
     "db:status:test": "bun run scripts/database-migrations.ts status --test",
+    "db:preflight": "bun run scripts/schema-integrity-preflight.ts",
+    "db:preflight:test": "bun run scripts/schema-integrity-preflight.ts --test",
     "build": "bun build ./src/index.ts --target=bun --outdir=dist",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",

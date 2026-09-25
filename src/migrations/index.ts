@@ -117,7 +117,7 @@ const EXPECTED_COLUMNS: Record<string, ExpectedColumn[]> = {
   ),
 };
 
-const EXPECTED_CONSTRAINTS = new Set(
+const BASELINE_CONSTRAINTS = new Set(
   [
     "chat_attachments:chat_attachments_kind_valid:c",
     "chat_attachments:chat_attachments_owner_id_fkey:f",
@@ -182,7 +182,7 @@ const EXPECTED_CONSTRAINTS = new Set(
   ].sort(),
 );
 
-const EXPECTED_INDEXES = new Set(
+const BASELINE_INDEXES = new Set(
   [
     "chat_attachments:chat_attachments_owner_idx",
     "chat_attachments:chat_attachments_pkey",
@@ -225,6 +225,31 @@ const sameSet = (actual: Set<string>, expected: Set<string>) =>
   actual.size === expected.size &&
   [...actual].every((value) => expected.has(value));
 
+const union = (left: Set<string>, right: Set<string>) =>
+  new Set([...left, ...right]);
+
+const C3_CONSTRAINTS = new Set([
+  "chat_attachments:chat_attachments_id_owner_unique:u",
+  "group_messages:group_messages_attachment_owner_fkey:f",
+  "group_messages:group_messages_group_id_id_unique:u",
+  "group_messages:group_messages_reply_same_group_fkey:f",
+  "group_reads:group_reads_message_same_group_fkey:f",
+  "messages:messages_attachment_owner_fkey:f",
+  "messages:messages_attachment_requires_sender:c",
+  "messages:messages_participants_valid:c",
+  "messages:messages_state_consistency:c",
+  "users:users_display_name_valid:c",
+]);
+
+const C3_INDEXES = new Set([
+  "chat_attachments:chat_attachments_id_owner_unique",
+  "group_messages:group_messages_group_id_id_unique",
+  "messages:messages_private_delivery_order_unique_idx",
+]);
+
+const CURRENT_CONSTRAINTS = union(BASELINE_CONSTRAINTS, C3_CONSTRAINTS);
+const CURRENT_INDEXES = union(BASELINE_INDEXES, C3_INDEXES);
+
 export const hasApplicationSchema = async (database: SQL) => {
   const names = Object.keys(EXPECTED_COLUMNS);
   const [row] = await database<{ count: number }[]>`
@@ -235,7 +260,11 @@ export const hasApplicationSchema = async (database: SQL) => {
   return (row?.count ?? 0) > 0;
 };
 
-export const verifyBaselineSchema = async (database: SQL) => {
+const verifySchema = async (
+  database: SQL,
+  expectedConstraints: Set<string>,
+  expectedIndexes: Set<string>,
+) => {
   const tables = Object.keys(EXPECTED_COLUMNS);
   const columns = await database<
     {
@@ -285,7 +314,7 @@ export const verifyBaselineSchema = async (database: SQL) => {
   const constraintSet = new Set(
     constraints.map((item) => `${item.tableName}:${item.name}:${item.type}`),
   );
-  if (!sameSet(constraintSet, EXPECTED_CONSTRAINTS)) {
+  if (!sameSet(constraintSet, expectedConstraints)) {
     throw new MigrationError("schema drift detected in constraints.");
   }
 
@@ -297,10 +326,16 @@ export const verifyBaselineSchema = async (database: SQL) => {
   const indexSet = new Set(
     indexes.map((item) => `${item.tableName}:${item.name}`),
   );
-  if (!sameSet(indexSet, EXPECTED_INDEXES)) {
+  if (!sameSet(indexSet, expectedIndexes)) {
     throw new MigrationError("schema drift detected in indexes.");
   }
 };
+
+export const verifyBaselineSchema = (database: SQL) =>
+  verifySchema(database, BASELINE_CONSTRAINTS, BASELINE_INDEXES);
+
+export const verifyCurrentSchema = (database: SQL) =>
+  verifySchema(database, CURRENT_CONSTRAINTS, CURRENT_INDEXES);
 
 const historyExists = async (database: SQL) => {
   const [row] = await database<{ exists: boolean }[]>`
@@ -369,7 +404,11 @@ export const getMigrationStatus = async (
     .filter((migration) => !applied.includes(migration.version))
     .map((migration) => migration.version);
   const schemaVerified = pending.length === 0;
-  if (schemaVerified) await verifyBaselineSchema(database);
+  if (schemaVerified) {
+    if (migrations.some((migration) => migration.version >= 2))
+      await verifyCurrentSchema(database);
+    else await verifyBaselineSchema(database);
+  }
   return { applied, pending, ready: schemaVerified, schemaVerified };
 };
 

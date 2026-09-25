@@ -97,6 +97,7 @@ const api = integration?.apiUrl,
       });
       expect(create.status).toBe(201);
       const group = ((await create.json()) as any).group;
+      const createdGroupUpdatedAt = new Date(group.updatedAt).getTime();
       expect(group.members).toHaveLength(3);
       expect(group.members.find((m: any) => m.id === a.id).role).toBe("owner");
       await until(() => sb.events.some((x) => x.type === "group.updated"));
@@ -134,6 +135,12 @@ const api = integration?.apiUrl,
           x.type === "group.message.new" &&
           x.message.messageText === "Hello team",
       ).message;
+      const [activity] = await db<{ updatedAt: Date | string }[]>`
+        SELECT updated_at AS "updatedAt" FROM groups WHERE id=${group.id}
+      `;
+      expect(new Date(activity!.updatedAt).getTime()).toBeGreaterThan(
+        createdGroupUpdatedAt,
+      );
       const listB = await call("/api/groups", b.cookie);
       expect(
         ((await listB.json()) as any).groups.find((g: any) => g.id === group.id)
