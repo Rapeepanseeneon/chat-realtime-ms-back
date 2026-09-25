@@ -30,9 +30,32 @@ the email address and other private account fields. Exact email remains a
 discoverability key for signed-in users, while registration uses one generic
 conflict response for username/email collisions.
 
-On startup, the backend uses `DATABASE_URL` to connect to PostgreSQL and creates
-the `users`, `sessions`, and `messages` tables and their indexes if needed.
+On startup, the backend uses `DATABASE_URL` and verifies that every committed
+database migration is already applied. Startup is read-only and fails closed
+when migrations are pending or the recorded checksum/schema has drifted.
 Passwords are hashed with Argon2id and session cookies are HttpOnly.
+
+## Database migrations
+
+Schema changes are explicit and serialized with a PostgreSQL advisory lock.
+Check status and apply pending migrations before starting application traffic:
+
+```powershell
+bun run db:status
+bun run db:migrate
+bun run db:status
+```
+
+The first migration is a baseline of the current Pb schema. For an existing
+database, `db:migrate` first verifies every expected table, column, constraint,
+and index. Only an exact match is adopted into `schema_migrations`; application
+tables and data are not recreated. A partial or mismatched schema, an unknown
+history row, or a changed checksum stops the command without automatic repair.
+
+For a new empty database, the baseline and its history row are created in one
+transaction. Transactional migrations roll back on error, and repeated runs are
+idempotent. Migration files are immutable after they have been applied; add a
+new numbered file for later changes.
 
 ## Isolated integration tests
 
@@ -54,6 +77,15 @@ $env:TEST_DATABASE_URL = "postgresql://username:password@localhost:5432/pb_messe
 $env:TEST_BACKEND_PORT = "3101"
 $env:CHAT_TEST_API_URL = "http://localhost:3101"
 bun run test:integration:backend
+```
+
+Apply and verify the same migrations against the dedicated test database before
+starting that backend:
+
+```powershell
+bun run db:status:test
+bun run db:migrate:test
+bun run db:status:test
 ```
 
 In a second terminal with the same three variables, run `bun run

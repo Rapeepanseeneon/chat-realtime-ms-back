@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { SQL } from "bun";
 import { createServer } from "node:net";
+import { migrateDatabase } from "../src/migrations";
 import { requireTestDatabase } from "../src/testing/test-environment";
 
 // Opt-in integration test. A disposable PostgreSQL schema and real backend
@@ -109,6 +110,7 @@ const testDatabase = Bun.env.TEST_DATABASE_URL ? requireTestDatabase() : null;
     try {
       // schema is generated exclusively from a UUID; never a user-supplied identifier.
       await admin.unsafe(`CREATE SCHEMA ${schema}`);
+      await migrateDatabase(db);
       await start();
       const users = [] as { id: string; username: string; cookie: string }[];
       for (const letter of ["A", "B", "C"]) {
