@@ -1758,7 +1758,7 @@ app.get("/api/friends", requireAuth, async (context) => {
 app.put("/api/friends/:friendId/favorite", requireAuth, async (context) => {
   const friendId = context.req.param("friendId") ?? "";
   const value = await readJson(context);
-  if (!/^[1-9]\d{0,18}$/.test(friendId) || typeof value?.favorite !== "boolean")
+  if (!isDatabaseId(friendId) || typeof value?.favorite !== "boolean")
     return context.json({ error: "Invalid favorite preference." }, 400);
   const saved = await setFavoriteFriend(
     context.get("user").id,
@@ -1840,7 +1840,7 @@ app.post("/api/friend-requests", requireAuth, async (context) => {
   const receiverId =
     typeof value?.receiverId === "string" ? value.receiverId.trim() : "";
   const sender = context.get("user");
-  if (!/^\d+$/.test(receiverId)) {
+  if (!isDatabaseId(receiverId)) {
     return context.json({ error: "Please select a valid user." }, 400);
   }
   if (receiverId === sender.id) {
@@ -1894,7 +1894,7 @@ app.put("/api/friend-requests/:requestId", requireAuth, async (context) => {
   const value = await readJson(context);
   const action = value?.action;
   if (
-    !/^\d+$/.test(requestId) ||
+    !isDatabaseId(requestId) ||
     (action !== "accept" && action !== "reject")
   ) {
     return context.json(
@@ -1936,7 +1936,7 @@ app.delete("/api/friend-requests/:requestId", requireAuth, async (context) => {
   );
   if (limited) return limited;
   const requestId = context.req.param("requestId") ?? "";
-  if (!/^\d+$/.test(requestId))
+  if (!isDatabaseId(requestId))
     return context.json({ error: "Invalid friend request." }, 400);
   try {
     const cancelled = await cancelFriendRequest(
@@ -2095,11 +2095,7 @@ app.get("/api/ghosts/:messageId", requireAuth, async (context) => {
 app.get("/api/messages/:userId", requireAuth, async (context) => {
   const currentUser = context.get("user");
   const otherUserId = context.req.param("userId");
-  if (
-    !otherUserId ||
-    !/^\d+$/.test(otherUserId) ||
-    otherUserId === currentUser.id
-  ) {
+  if (!isDatabaseId(otherUserId) || otherUserId === currentUser.id) {
     return context.json({ error: "Please select a valid user." }, 400);
   }
 

@@ -441,33 +441,49 @@ export const getFriends = async (
   const rows = await database<
     (FriendListUser & { recentAt: Date | string | null })[]
   >`
+    WITH accepted_friends AS (
+      SELECT CASE
+        WHEN request.sender_id = ${currentUserId} THEN request.receiver_id
+        ELSE request.sender_id
+      END AS friend_id
+      FROM friend_requests request
+      WHERE request.status = 'accepted'
+        AND (request.sender_id = ${currentUserId} OR request.receiver_id = ${currentUserId})
+    ), private_activity AS (
+      SELECT activity.friend_id, max(activity.created_at) AS recent_at
+      FROM (
+        SELECT receiver_id AS friend_id, created_at
+        FROM messages
+        WHERE sender_id = ${currentUserId}
+          AND message_status = 'sent' AND deleted_at IS NULL
+        UNION ALL
+        SELECT sender_id AS friend_id, created_at
+        FROM messages
+        WHERE receiver_id = ${currentUserId}
+          AND message_status = 'sent' AND deleted_at IS NULL
+      ) activity
+      GROUP BY activity.friend_id
+    ), shared_group_activity AS (
+      SELECT theirs.user_id AS friend_id, max(message.created_at) AS recent_at
+      FROM group_members mine
+      JOIN group_messages message ON message.group_id = mine.group_id
+      JOIN group_members theirs ON theirs.group_id = mine.group_id
+        AND theirs.user_id <> ${currentUserId}
+      WHERE mine.user_id = ${currentUserId}
+      GROUP BY theirs.user_id
+    )
     SELECT users.id::text AS id, users.username,
       COALESCE(NULLIF(users.display_name, ''), users.username) AS "displayName",
       users.avatar_url AS "avatarUrl",
       CASE WHEN COALESCE(privacy.profile_visibility, 'friends') = 'private' THEN '' ELSE users.bio END AS bio,
       (favorite.friend_id IS NOT NULL) AS favorite,
       GREATEST(private_recent.recent_at, group_recent.recent_at) AS "recentAt"
-    FROM friend_requests
-    JOIN users ON users.id = CASE
-      WHEN friend_requests.sender_id = ${currentUserId}
-        THEN friend_requests.receiver_id
-      ELSE friend_requests.sender_id
-    END
+    FROM accepted_friends
+    JOIN users ON users.id = accepted_friends.friend_id
     LEFT JOIN profile_privacy privacy ON privacy.user_id = users.id
     LEFT JOIN favorite_friends favorite ON favorite.user_id = ${currentUserId} AND favorite.friend_id = users.id
-    LEFT JOIN LATERAL (
-      SELECT max(created_at) AS recent_at FROM messages
-      WHERE message_status = 'sent' AND deleted_at IS NULL AND
-        ((sender_id = ${currentUserId} AND receiver_id = users.id) OR
-         (sender_id = users.id AND receiver_id = ${currentUserId}))
-    ) private_recent ON TRUE
-    LEFT JOIN LATERAL (
-      SELECT max(gm.created_at) AS recent_at FROM group_messages gm
-      JOIN group_members mine ON mine.group_id = gm.group_id AND mine.user_id = ${currentUserId}
-      JOIN group_members theirs ON theirs.group_id = gm.group_id AND theirs.user_id = users.id
-    ) group_recent ON TRUE
-    WHERE friend_requests.status = 'accepted'
-      AND (${currentUserId} = friend_requests.sender_id OR ${currentUserId} = friend_requests.receiver_id)
+    LEFT JOIN private_activity private_recent ON private_recent.friend_id = users.id
+    LEFT JOIN shared_group_activity group_recent ON group_recent.friend_id = users.id
     ORDER BY favorite DESC, "recentAt" DESC NULLS LAST, lower(users.username), users.id
   `;
   return rows.map((row) => ({
@@ -604,7 +620,7 @@ export const respondToFriendRequest = async (
   const rows = await database<{ id: string }[]>`
     UPDATE friend_requests
     SET status = ${status}, updated_at = NOW()
-    WHERE id::text = ${requestId}
+    WHERE id = ${requestId}::bigint
       AND receiver_id = ${receiverId}
       AND status = 'pending'
     RETURNING id::text AS id
@@ -644,7 +660,7 @@ export const cancelFriendRequest = async (
 ): Promise<boolean> => {
   const rows = await database<{ id: string }[]>`
     DELETE FROM friend_requests
-    WHERE id::text = ${requestId}
+    WHERE id = ${requestId}::bigint
       AND sender_id = ${senderId}
       AND status = 'pending'
     RETURNING id::text AS id
@@ -661,19 +677,22 @@ export const getFriendSuggestions = async (
       mutualFriendCount: number | string | null;
     })[]
   >`
-    WITH my_friends AS (
-      SELECT CASE WHEN sender_id = ${currentUserId} THEN receiver_id ELSE sender_id END AS friend_id
+    WITH accepted_edges AS (
+      SELECT sender_id AS user_id, receiver_id AS friend_id
       FROM friend_requests
       WHERE status = 'accepted'
-        AND (sender_id = ${currentUserId} OR receiver_id = ${currentUserId})
+      UNION ALL
+      SELECT receiver_id AS user_id, sender_id AS friend_id
+      FROM friend_requests
+      WHERE status = 'accepted'
+    ), my_friends AS (
+      SELECT friend_id FROM accepted_edges WHERE user_id = ${currentUserId}
     ), candidates AS (
-      SELECT CASE WHEN request.sender_id = mine.friend_id THEN request.receiver_id ELSE request.sender_id END AS candidate_id,
+      SELECT edge.friend_id AS candidate_id,
         count(DISTINCT mine.friend_id)::int AS mutual_count
       FROM my_friends mine
-      JOIN friend_requests request
-        ON request.status = 'accepted'
-       AND (request.sender_id = mine.friend_id OR request.receiver_id = mine.friend_id)
-      GROUP BY candidate_id
+      JOIN accepted_edges edge ON edge.user_id = mine.friend_id
+      GROUP BY edge.friend_id
     )
     SELECT users.id::text AS id, users.username,
       COALESCE(NULLIF(users.display_name, ''), users.username) AS "displayName",
@@ -902,7 +921,7 @@ export const findChatUserById = async (
   const [user] = await database<ChatUser[]>`
     SELECT id::text AS id, username, avatar_url AS "avatarUrl", bio
     FROM users
-    WHERE id::text = ${userId}
+    WHERE id = ${userId}::bigint
     LIMIT 1
   `;
   return user ?? null;
@@ -1583,7 +1602,7 @@ export const markMessagesRead = async (
 ): Promise<{ readAt: string | null; throughDeliveryId: string } | null> => {
   const [boundary] = await database<{ id: string; deliveryId: string }[]>`
     SELECT id::text AS id, COALESCE(delivery_id, id)::text AS "deliveryId" FROM messages
-    WHERE id::text = ${throughMessageId}
+    WHERE id = ${throughMessageId}::bigint
       AND receiver_id = ${receiverId} AND sender_id = ${senderId}
       AND message_status = 'sent'
   `;
@@ -1663,15 +1682,31 @@ const normalizeGroupMessage = (row: GroupMessageRow): GroupMessage => ({
 
 export const getGroups = async (userId: string): Promise<GroupSummary[]> => {
   const rows = await database<GroupSummaryRow[]>`
+    WITH my_groups AS (
+      SELECT group_id, role FROM group_members WHERE user_id = ${userId}
+    ), member_counts AS (
+      SELECT members.group_id, count(*)::integer AS member_count
+      FROM group_members members
+      JOIN my_groups mine ON mine.group_id = members.group_id
+      GROUP BY members.group_id
+    ), unread_counts AS (
+      SELECT message.group_id, count(*)::integer AS unread_count
+      FROM group_messages message
+      JOIN my_groups mine ON mine.group_id = message.group_id
+      LEFT JOIN group_reads reads ON reads.group_id = message.group_id AND reads.user_id = ${userId}
+      WHERE message.id > COALESCE(reads.last_read_message_id, 0)
+        AND message.sender_id <> ${userId}
+        AND message.deleted_at IS NULL
+      GROUP BY message.group_id
+    )
     SELECT g.id::text id, g.name, g.created_by::text AS "createdBy", g.created_at AS "createdAt",
-      g.updated_at AS "updatedAt", mine.role, count(DISTINCT members.user_id)::integer AS "memberCount",
-      count(DISTINCT message.id) FILTER (WHERE message.id > COALESCE(reads.last_read_message_id, 0)
-        AND message.sender_id <> ${userId} AND message.deleted_at IS NULL)::integer AS "unreadCount"
-    FROM groups g JOIN group_members mine ON mine.group_id=g.id AND mine.user_id=${userId}
-    JOIN group_members members ON members.group_id=g.id
-    LEFT JOIN group_reads reads ON reads.group_id=g.id AND reads.user_id=${userId}
-    LEFT JOIN group_messages message ON message.group_id=g.id
-    GROUP BY g.id,mine.role,reads.last_read_message_id ORDER BY g.updated_at DESC,g.id DESC`;
+      g.updated_at AS "updatedAt", mine.role, members.member_count AS "memberCount",
+      COALESCE(unread.unread_count, 0)::integer AS "unreadCount"
+    FROM my_groups mine
+    JOIN groups g ON g.id = mine.group_id
+    JOIN member_counts members ON members.group_id = g.id
+    LEFT JOIN unread_counts unread ON unread.group_id = g.id
+    ORDER BY g.updated_at DESC,g.id DESC`;
   return rows.map(normalizeGroupSummary);
 };
 
@@ -1693,10 +1728,23 @@ export const getGroupInfo = async (
   groupId: string,
   viewerId: string,
 ): Promise<GroupInfo | null> => {
-  const summary = (await getGroups(viewerId)).find(
-    (group) => group.id === groupId,
-  );
-  if (!summary) return null;
+  const [summaryRow] = await database<GroupSummaryRow[]>`
+    SELECT g.id::text id, g.name, g.created_by::text AS "createdBy",
+      g.created_at AS "createdAt", g.updated_at AS "updatedAt", mine.role,
+      (SELECT count(*)::integer FROM group_members members WHERE members.group_id = g.id) AS "memberCount",
+      (SELECT count(*)::integer
+       FROM group_messages message
+       LEFT JOIN group_reads reads ON reads.group_id = message.group_id AND reads.user_id = ${viewerId}
+       WHERE message.group_id = g.id
+         AND message.id > COALESCE(reads.last_read_message_id, 0)
+         AND message.sender_id <> ${viewerId}
+         AND message.deleted_at IS NULL) AS "unreadCount"
+    FROM groups g
+    JOIN group_members mine ON mine.group_id = g.id AND mine.user_id = ${viewerId}
+    WHERE g.id = ${groupId}
+  `;
+  if (!summaryRow) return null;
+  const summary = normalizeGroupSummary(summaryRow);
   const rows = await database<(GroupMember & { joinedAt: Date | string })[]>`
     SELECT u.id::text id,u.username,u.avatar_url AS "avatarUrl",
       CASE
