@@ -1,5 +1,9 @@
 import { SQL } from "bun";
 import { assertDatabaseReady } from "./migrations";
+import {
+  encodePrivateHistoryCursor,
+  type PrivateHistoryCursor,
+} from "./history-pagination";
 
 export type StoredMessage = {
   id: string;
@@ -130,6 +134,12 @@ export type PrivateMessage = {
   } | null;
 };
 
+export type PrivateHistoryPage = {
+  messages: PrivateMessage[];
+  hasMore: boolean;
+  nextCursor: string | null;
+};
+
 export type UnreadCount = { friendId: string; unreadCount: number };
 
 export type GroupSummary = {
@@ -170,6 +180,12 @@ export type GroupMessage = {
     editedAt: string | null;
     deletedAt: string | null;
   } | null;
+};
+
+export type GroupHistoryPage = {
+  messages: GroupMessage[];
+  hasMore: boolean;
+  nextBeforeId: string | null;
 };
 
 export type User = {
@@ -1488,21 +1504,53 @@ export const mutatePrivateMessage = async (
 export const getPrivateMessages = async (
   currentUserId: string,
   otherUserId: string,
-): Promise<PrivateMessage[]> => {
-  const messages = await database<{ id: string }[]>`
-      SELECT id::text AS id
+  options: { limit: number; before: PrivateHistoryCursor | null },
+): Promise<PrivateHistoryPage> => {
+  const pageSize = options.limit + 1;
+  const messages = options.before
+    ? await database<{ id: string; effectiveAt: Date | string }[]>`
+      SELECT messages.id::text AS id,
+        COALESCE(messages.released_at, messages.created_at) AS "effectiveAt"
       FROM messages
       WHERE
         ((sender_id = ${currentUserId} AND receiver_id = ${otherUserId})
         OR (sender_id = ${otherUserId} AND receiver_id = ${currentUserId}))
         AND (message_status = 'sent' OR (sender_id = ${currentUserId} AND message_status IN ('ghost', 'scheduled')))
-      ORDER BY COALESCE(released_at, created_at) DESC, id DESC
-      LIMIT 50
-  `;
-  return selectPrivateMessages(
-    messages.map((message) => message.id),
-    currentUserId,
-  );
+        AND (COALESCE(messages.released_at, messages.created_at), messages.id)
+          < (${options.before.effectiveAt}::timestamptz, ${options.before.id}::bigint)
+      ORDER BY COALESCE(messages.released_at, messages.created_at) DESC,
+        messages.id DESC
+      LIMIT ${pageSize}
+    `
+    : await database<{ id: string; effectiveAt: Date | string }[]>`
+      SELECT messages.id::text AS id,
+        COALESCE(messages.released_at, messages.created_at) AS "effectiveAt"
+      FROM messages
+      WHERE
+        ((sender_id = ${currentUserId} AND receiver_id = ${otherUserId})
+        OR (sender_id = ${otherUserId} AND receiver_id = ${currentUserId}))
+        AND (message_status = 'sent' OR (sender_id = ${currentUserId} AND message_status IN ('ghost', 'scheduled')))
+      ORDER BY COALESCE(messages.released_at, messages.created_at) DESC,
+        messages.id DESC
+      LIMIT ${pageSize}
+    `;
+  const hasMore = messages.length > options.limit;
+  const page = messages.slice(0, options.limit);
+  const oldest = page.at(-1);
+  return {
+    messages: await selectPrivateMessages(
+      page.map((message) => message.id),
+      currentUserId,
+    ),
+    hasMore,
+    nextCursor:
+      hasMore && oldest
+        ? encodePrivateHistoryCursor({
+            effectiveAt: toIsoString(oldest.effectiveAt),
+            id: oldest.id,
+          })
+        : null,
+  };
 };
 
 export const getUnreadCounts = async (
@@ -1728,12 +1776,29 @@ const selectGroupMessages = async (ids: string[]): Promise<GroupMessage[]> => {
 export const getGroupMessages = async (
   groupId: string,
   userId: string,
-): Promise<GroupMessage[] | null> => {
+  options: { limit: number; beforeId: string | null },
+): Promise<GroupHistoryPage | null> => {
   if (!(await isGroupMember(groupId, userId))) return null;
-  const rows = await database<
-    { id: string }[]
-  >`SELECT id::text id FROM group_messages WHERE group_id=${groupId} ORDER BY id DESC LIMIT 50`;
-  return selectGroupMessages(rows.reverse().map((row) => row.id));
+  const pageSize = options.limit + 1;
+  const rows = options.beforeId
+    ? await database<
+        { id: string }[]
+      >`SELECT group_messages.id::text AS id FROM group_messages
+        WHERE group_id=${groupId} AND group_messages.id < ${options.beforeId}::bigint
+        ORDER BY group_messages.id DESC LIMIT ${pageSize}`
+    : await database<
+        { id: string }[]
+      >`SELECT group_messages.id::text AS id FROM group_messages
+        WHERE group_id=${groupId}
+        ORDER BY group_messages.id DESC LIMIT ${pageSize}`;
+  const hasMore = rows.length > options.limit;
+  const page = rows.slice(0, options.limit);
+  const oldest = page.at(-1);
+  return {
+    messages: await selectGroupMessages(page.map((row) => row.id)),
+    hasMore,
+    nextBeforeId: hasMore && oldest ? oldest.id : null,
+  };
 };
 
 export const createGroupMessage = async (

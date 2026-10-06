@@ -99,6 +99,12 @@ import {
   readJsonObject,
 } from "./security/request-limits";
 import { assertTestBackendRuntime } from "./testing/test-environment";
+import {
+  InvalidHistoryPaginationError,
+  parseGroupHistoryBeforeId,
+  parseHistoryPageLimit,
+  parsePrivateHistoryCursor,
+} from "./history-pagination";
 
 const MAX_MESSAGE_LENGTH = 1_000;
 const MIN_PASSWORD_LENGTH = 8;
@@ -2012,10 +2018,20 @@ app.get("/api/groups/:groupId/messages", requireAuth, async (context) => {
   const id = context.req.param("groupId") ?? "";
   if (!/^[1-9]\d{0,18}$/.test(id))
     return context.json({ error: "Group not found." }, 404);
-  const messages = await getGroupMessages(id, context.get("user").id);
-  return messages
-    ? context.json({ messages })
-    : context.json({ error: "You are not a member of this group." }, 403);
+  try {
+    const page = await getGroupMessages(id, context.get("user").id, {
+      limit: parseHistoryPageLimit(context.req.query("limit")),
+      beforeId: parseGroupHistoryBeforeId(context.req.query("beforeId")),
+    });
+    return page
+      ? context.json(page)
+      : context.json({ error: "You are not a member of this group." }, 403);
+  } catch (error) {
+    if (error instanceof InvalidHistoryPaginationError)
+      return context.json({ error: error.message }, 400);
+    console.error("Failed to load group message history", error);
+    return context.json({ error: "Group history could not be loaded." }, 500);
+  }
 });
 
 app.put("/api/groups/:groupId", requireAuth, async (context) => {
@@ -2096,9 +2112,14 @@ app.get("/api/messages/:userId", requireAuth, async (context) => {
         403,
       );
     }
-    const messages = await getPrivateMessages(currentUser.id, otherUserId);
-    return context.json({ messages });
+    const page = await getPrivateMessages(currentUser.id, otherUserId, {
+      limit: parseHistoryPageLimit(context.req.query("limit")),
+      before: parsePrivateHistoryCursor(context.req.query("before")),
+    });
+    return context.json(page);
   } catch (error) {
+    if (error instanceof InvalidHistoryPaginationError)
+      return context.json({ error: error.message }, 400);
     console.error("Failed to load private message history", error);
     return context.json({ error: "Message history could not be loaded." }, 500);
   }
