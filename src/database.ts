@@ -1532,8 +1532,9 @@ export const getPrivateMessages = async (
         COALESCE(messages.released_at, messages.created_at) AS "effectiveAt"
       FROM messages
       WHERE
-        ((sender_id = ${currentUserId} AND receiver_id = ${otherUserId})
-        OR (sender_id = ${otherUserId} AND receiver_id = ${currentUserId}))
+        sender_id IS NOT NULL AND receiver_id IS NOT NULL
+        AND LEAST(sender_id, receiver_id) = LEAST(${currentUserId}::bigint, ${otherUserId}::bigint)
+        AND GREATEST(sender_id, receiver_id) = GREATEST(${currentUserId}::bigint, ${otherUserId}::bigint)
         AND (message_status = 'sent' OR (sender_id = ${currentUserId} AND message_status IN ('ghost', 'scheduled')))
         AND (COALESCE(messages.released_at, messages.created_at), messages.id)
           < (${options.before.effectiveAt}::timestamptz, ${options.before.id}::bigint)
@@ -1546,8 +1547,9 @@ export const getPrivateMessages = async (
         COALESCE(messages.released_at, messages.created_at) AS "effectiveAt"
       FROM messages
       WHERE
-        ((sender_id = ${currentUserId} AND receiver_id = ${otherUserId})
-        OR (sender_id = ${otherUserId} AND receiver_id = ${currentUserId}))
+        sender_id IS NOT NULL AND receiver_id IS NOT NULL
+        AND LEAST(sender_id, receiver_id) = LEAST(${currentUserId}::bigint, ${otherUserId}::bigint)
+        AND GREATEST(sender_id, receiver_id) = GREATEST(${currentUserId}::bigint, ${otherUserId}::bigint)
         AND (message_status = 'sent' OR (sender_id = ${currentUserId} AND message_status IN ('ghost', 'scheduled')))
       ORDER BY COALESCE(messages.released_at, messages.created_at) DESC,
         messages.id DESC

@@ -247,8 +247,24 @@ const C3_INDEXES = new Set([
   "messages:messages_private_delivery_order_unique_idx",
 ]);
 
+const C4_REMOVED_INDEXES = new Set([
+  "group_messages:group_messages_history_idx",
+]);
+
+const C4_INDEXES = new Set([
+  "messages:messages_private_effective_history_idx",
+  "users:users_username_lower_trgm_idx",
+]);
+
 const CURRENT_CONSTRAINTS = union(BASELINE_CONSTRAINTS, C3_CONSTRAINTS);
-const CURRENT_INDEXES = union(BASELINE_INDEXES, C3_INDEXES);
+const CURRENT_INDEXES = union(
+  new Set(
+    [...union(BASELINE_INDEXES, C3_INDEXES)].filter(
+      (index) => !C4_REMOVED_INDEXES.has(index),
+    ),
+  ),
+  C4_INDEXES,
+);
 
 export const hasApplicationSchema = async (database: SQL) => {
   const names = Object.keys(EXPECTED_COLUMNS);

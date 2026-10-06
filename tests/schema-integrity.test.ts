@@ -36,7 +36,7 @@ const expectConstraint = async (
 
     try {
       const status = await migrateDatabase(database);
-      expect(status.applied).toEqual([1, 2]);
+      expect(status.applied).toEqual([1, 2, 3]);
 
       const users = await database<{ id: string }[]>`
         INSERT INTO users(username, display_name, email, password_hash)
