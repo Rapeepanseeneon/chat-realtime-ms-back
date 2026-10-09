@@ -4,6 +4,16 @@ import {
   encodePrivateHistoryCursor,
   type PrivateHistoryCursor,
 } from "./history-pagination";
+import {
+  encodeDateIdCursor,
+  encodeFriendCursor,
+  encodeMemberCursor,
+  GROUP_MEMBER_BATCH_SIZE,
+  iterateIdBatches,
+  type DateIdCursor,
+  type FriendCursor,
+  type MemberCursor,
+} from "./list-pagination";
 
 export type StoredMessage = {
   id: string;
@@ -158,7 +168,16 @@ export type GroupMember = ChatUser & {
   joinedAt: string;
 };
 
-export type GroupInfo = GroupSummary & { members: GroupMember[] };
+export type ListPage<T> = {
+  items: T[];
+  hasMore: boolean;
+  nextCursor: string | null;
+};
+
+export type GroupInfo = GroupSummary & {
+  members: GroupMember[];
+  memberPage: { hasMore: boolean; nextCursor: string | null };
+};
 
 export type GroupMessage = {
   id: string;
@@ -492,6 +511,100 @@ export const getFriends = async (
   }));
 };
 
+export const getFriendsPage = async (
+  currentUserId: string,
+  options: { limit: number; cursor: FriendCursor | null },
+): Promise<ListPage<FriendListUser>> => {
+  const pageSize = options.limit + 1;
+  const rows = await database<
+    (FriendListUser & {
+      normalizedName: string;
+      recentAt: Date | string | null;
+    })[]
+  >`
+    WITH friend_page AS (
+      SELECT users.id, users.username, users.display_name, users.avatar_url, users.bio
+      FROM friend_requests request
+      JOIN users ON users.id = CASE
+        WHEN request.sender_id = ${currentUserId} THEN request.receiver_id
+        ELSE request.sender_id
+      END
+      WHERE request.status = 'accepted'
+        AND (request.sender_id = ${currentUserId} OR request.receiver_id = ${currentUserId})
+        AND (${options.cursor?.name ?? null}::text IS NULL OR
+          (lower(users.username), users.id) >
+            (${options.cursor?.name ?? null}::text, ${options.cursor?.id ?? null}::bigint))
+      ORDER BY lower(users.username), users.id
+      LIMIT ${pageSize}
+    ), private_activity AS (
+      SELECT activity.friend_id, max(activity.created_at) AS recent_at
+      FROM (
+        SELECT receiver_id AS friend_id, created_at FROM messages
+        WHERE sender_id = ${currentUserId} AND message_status = 'sent' AND deleted_at IS NULL
+        UNION ALL
+        SELECT sender_id AS friend_id, created_at FROM messages
+        WHERE receiver_id = ${currentUserId} AND message_status = 'sent' AND deleted_at IS NULL
+      ) activity
+      JOIN friend_page friend ON friend.id = activity.friend_id
+      GROUP BY activity.friend_id
+    ), shared_group_activity AS (
+      SELECT theirs.user_id AS friend_id, max(message.created_at) AS recent_at
+      FROM group_members mine
+      JOIN group_messages message ON message.group_id = mine.group_id
+      JOIN group_members theirs ON theirs.group_id = mine.group_id
+      JOIN friend_page friend ON friend.id = theirs.user_id
+      WHERE mine.user_id = ${currentUserId}
+      GROUP BY theirs.user_id
+    )
+    SELECT friend.id::text AS id, friend.username,
+      lower(friend.username) AS "normalizedName",
+      COALESCE(NULLIF(friend.display_name, ''), friend.username) AS "displayName",
+      friend.avatar_url AS "avatarUrl",
+      CASE WHEN COALESCE(privacy.profile_visibility, 'friends') = 'private' THEN '' ELSE friend.bio END AS bio,
+      (favorite.friend_id IS NOT NULL) AS favorite,
+      GREATEST(private_recent.recent_at, group_recent.recent_at) AS "recentAt"
+    FROM friend_page friend
+    LEFT JOIN profile_privacy privacy ON privacy.user_id = friend.id
+    LEFT JOIN favorite_friends favorite ON favorite.user_id = ${currentUserId} AND favorite.friend_id = friend.id
+    LEFT JOIN private_activity private_recent ON private_recent.friend_id = friend.id
+    LEFT JOIN shared_group_activity group_recent ON group_recent.friend_id = friend.id
+    ORDER BY lower(friend.username), friend.id
+  `;
+  const hasMore = rows.length > options.limit;
+  const page = rows.slice(0, options.limit);
+  const items = page
+    .map(({ normalizedName: _normalizedName, ...row }) => ({
+      ...row,
+      recentAt: row.recentAt ? toIsoString(row.recentAt) : null,
+    }))
+    .sort((left, right) => {
+      if (left.favorite !== right.favorite) return left.favorite ? -1 : 1;
+      if (left.recentAt !== right.recentAt) {
+        if (!left.recentAt) return 1;
+        if (!right.recentAt) return -1;
+        const recent = right.recentAt.localeCompare(left.recentAt);
+        if (recent) return recent;
+      }
+      const username = left.username.localeCompare(right.username, undefined, {
+        sensitivity: "base",
+      });
+      if (username) return username;
+      return BigInt(left.id) < BigInt(right.id) ? -1 : 1;
+    });
+  const oldest = page.at(-1);
+  return {
+    items,
+    hasMore,
+    nextCursor:
+      hasMore && oldest
+        ? encodeFriendCursor({
+            name: oldest.normalizedName,
+            id: oldest.id,
+          })
+        : null,
+  };
+};
+
 export const searchUsers = async (
   currentUserId: string,
   query: string,
@@ -530,7 +643,9 @@ export const searchUsers = async (
 
 export const getReceivedFriendRequests = async (
   currentUserId: string,
-): Promise<FriendRequest[]> => {
+  options: { limit: number; cursor: DateIdCursor | null },
+): Promise<ListPage<FriendRequest>> => {
+  const pageSize = options.limit + 1;
   const rows = await database<FriendRequestRow[]>`
     SELECT
       friend_requests.id::text AS id,
@@ -543,9 +658,15 @@ export const getReceivedFriendRequests = async (
     JOIN users ON users.id = friend_requests.sender_id
     WHERE friend_requests.receiver_id = ${currentUserId}
       AND friend_requests.status = 'pending'
+      AND (${options.cursor?.at ?? null}::timestamptz IS NULL OR
+        (friend_requests.created_at, friend_requests.id) <
+          (${options.cursor?.at ?? null}::timestamptz, ${options.cursor?.id ?? null}::bigint))
     ORDER BY friend_requests.created_at DESC, friend_requests.id DESC
+    LIMIT ${pageSize}
   `;
-  return rows.map((row) => ({
+  const hasMore = rows.length > options.limit;
+  const page = rows.slice(0, options.limit);
+  const requests = page.map((row) => ({
     id: row.id,
     sender: {
       id: row.senderId,
@@ -555,6 +676,18 @@ export const getReceivedFriendRequests = async (
     },
     createdAt: toIsoString(row.createdAt),
   }));
+  const oldest = requests.at(-1);
+  return {
+    items: requests,
+    hasMore,
+    nextCursor:
+      hasMore && oldest
+        ? encodeDateIdCursor("received", {
+            at: oldest.createdAt,
+            id: oldest.id,
+          })
+        : null,
+  };
 };
 
 export const getFriendshipStatus = async (
@@ -630,7 +763,9 @@ export const respondToFriendRequest = async (
 
 export const getSentFriendRequests = async (
   currentUserId: string,
-): Promise<SentFriendRequest[]> => {
+  options: { limit: number; cursor: DateIdCursor | null },
+): Promise<ListPage<SentFriendRequest>> => {
+  const pageSize = options.limit + 1;
   const rows = await database<
     (SentFriendRequest & { createdAt: Date | string })[]
   >`
@@ -646,12 +781,29 @@ export const getSentFriendRequests = async (
     JOIN users ON users.id = friend_requests.receiver_id
     WHERE friend_requests.sender_id = ${currentUserId}
       AND friend_requests.status = 'pending'
+      AND (${options.cursor?.at ?? null}::timestamptz IS NULL OR
+        (friend_requests.created_at, friend_requests.id) <
+          (${options.cursor?.at ?? null}::timestamptz, ${options.cursor?.id ?? null}::bigint))
     ORDER BY friend_requests.created_at DESC, friend_requests.id DESC
+    LIMIT ${pageSize}
   `;
-  return rows.map((row) => ({
+  const hasMore = rows.length > options.limit;
+  const requests = rows.slice(0, options.limit).map((row) => ({
     ...row,
     createdAt: toIsoString(row.createdAt),
   }));
+  const oldest = requests.at(-1);
+  return {
+    items: requests,
+    hasMore,
+    nextCursor:
+      hasMore && oldest
+        ? encodeDateIdCursor("sent", {
+            at: oldest.createdAt,
+            id: oldest.id,
+          })
+        : null,
+  };
 };
 
 export const cancelFriendRequest = async (
@@ -1682,34 +1834,55 @@ const normalizeGroupMessage = (row: GroupMessageRow): GroupMessage => ({
       : null,
 });
 
-export const getGroups = async (userId: string): Promise<GroupSummary[]> => {
+export const getGroups = async (
+  userId: string,
+  options: { limit: number; cursor: DateIdCursor | null },
+): Promise<ListPage<GroupSummary>> => {
+  const pageSize = options.limit + 1;
   const rows = await database<GroupSummaryRow[]>`
-    WITH my_groups AS (
-      SELECT group_id, role FROM group_members WHERE user_id = ${userId}
+    WITH group_page AS (
+      SELECT g.id, g.name, g.created_by, g.created_at, g.updated_at, membership.role
+      FROM group_members membership
+      JOIN groups g ON g.id = membership.group_id
+      WHERE membership.user_id = ${userId}
+        AND (${options.cursor?.at ?? null}::timestamptz IS NULL OR
+          (g.updated_at, g.id) <
+            (${options.cursor?.at ?? null}::timestamptz, ${options.cursor?.id ?? null}::bigint))
+      ORDER BY g.updated_at DESC, g.id DESC
+      LIMIT ${pageSize}
     ), member_counts AS (
       SELECT members.group_id, count(*)::integer AS member_count
       FROM group_members members
-      JOIN my_groups mine ON mine.group_id = members.group_id
+      JOIN group_page target ON target.id = members.group_id
       GROUP BY members.group_id
     ), unread_counts AS (
       SELECT message.group_id, count(*)::integer AS unread_count
       FROM group_messages message
-      JOIN my_groups mine ON mine.group_id = message.group_id
+      JOIN group_page target ON target.id = message.group_id
       LEFT JOIN group_reads reads ON reads.group_id = message.group_id AND reads.user_id = ${userId}
       WHERE message.id > COALESCE(reads.last_read_message_id, 0)
         AND message.sender_id <> ${userId}
         AND message.deleted_at IS NULL
       GROUP BY message.group_id
     )
-    SELECT g.id::text id, g.name, g.created_by::text AS "createdBy", g.created_at AS "createdAt",
-      g.updated_at AS "updatedAt", mine.role, members.member_count AS "memberCount",
+    SELECT target.id::text id, target.name, target.created_by::text AS "createdBy", target.created_at AS "createdAt",
+      target.updated_at AS "updatedAt", target.role, members.member_count AS "memberCount",
       COALESCE(unread.unread_count, 0)::integer AS "unreadCount"
-    FROM my_groups mine
-    JOIN groups g ON g.id = mine.group_id
-    JOIN member_counts members ON members.group_id = g.id
-    LEFT JOIN unread_counts unread ON unread.group_id = g.id
-    ORDER BY g.updated_at DESC,g.id DESC`;
-  return rows.map(normalizeGroupSummary);
+    FROM group_page target
+    JOIN member_counts members ON members.group_id = target.id
+    LEFT JOIN unread_counts unread ON unread.group_id = target.id
+    ORDER BY target.updated_at DESC,target.id DESC`;
+  const hasMore = rows.length > options.limit;
+  const items = rows.slice(0, options.limit).map(normalizeGroupSummary);
+  const oldest = items.at(-1);
+  return {
+    items,
+    hasMore,
+    nextCursor:
+      hasMore && oldest
+        ? encodeDateIdCursor("groups", { at: oldest.updatedAt, id: oldest.id })
+        : null,
+  };
 };
 
 export const isGroupMember = async (groupId: string, userId: string) =>
@@ -1719,16 +1892,32 @@ export const isGroupMember = async (groupId: string, userId: string) =>
     >`SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id=${groupId} AND user_id=${userId}) ok`
   )[0]?.ok ?? false;
 
-export const getGroupMemberIds = async (groupId: string): Promise<string[]> =>
-  (
-    await database<
-      { id: string }[]
-    >`SELECT user_id::text id FROM group_members WHERE group_id=${groupId}`
-  ).map((row) => row.id);
+export async function* iterateGroupMemberIds(
+  groupId: string,
+  batchSize = GROUP_MEMBER_BATCH_SIZE,
+): AsyncGenerator<string> {
+  yield* iterateIdBatches(async (afterId, limit) => {
+    const rows = afterId
+      ? await database<{ id: string }[]>`
+          SELECT user_id::text AS id FROM group_members
+          WHERE group_id=${groupId} AND user_id>${afterId}::bigint
+          ORDER BY user_id LIMIT ${limit}
+        `
+      : await database<{ id: string }[]>`
+          SELECT user_id::text AS id FROM group_members
+          WHERE group_id=${groupId} ORDER BY user_id LIMIT ${limit}
+        `;
+    return rows.map((row) => row.id);
+  }, batchSize);
+}
 
 export const getGroupInfo = async (
   groupId: string,
   viewerId: string,
+  options: { limit: number; cursor: MemberCursor | null } = {
+    limit: 50,
+    cursor: null,
+  },
 ): Promise<GroupInfo | null> => {
   const [summaryRow] = await database<GroupSummaryRow[]>`
     SELECT g.id::text id, g.name, g.created_by::text AS "createdBy",
@@ -1747,7 +1936,10 @@ export const getGroupInfo = async (
   `;
   if (!summaryRow) return null;
   const summary = normalizeGroupSummary(summaryRow);
-  const rows = await database<(GroupMember & { joinedAt: Date | string })[]>`
+  const pageSize = options.limit + 1;
+  const rows = await database<
+    (GroupMember & { joinedAt: Date | string; roleOrder: 0 | 1 })[]
+  >`
     SELECT u.id::text id,u.username,u.avatar_url AS "avatarUrl",
       CASE
         WHEN u.id = ${viewerId} THEN u.bio
@@ -1761,18 +1953,37 @@ export const getGroupInfo = async (
           ) THEN u.bio
         ELSE ''
       END AS bio,
-      gm.role,gm.joined_at AS "joinedAt"
+      gm.role,gm.joined_at AS "joinedAt",
+      CASE WHEN gm.role='owner' THEN 0 ELSE 1 END AS "roleOrder"
     FROM group_members gm
     JOIN users u ON u.id=gm.user_id
     LEFT JOIN profile_privacy privacy ON privacy.user_id=u.id
     WHERE gm.group_id=${groupId}
-    ORDER BY (gm.role='owner') DESC,gm.joined_at,u.id`;
+      AND (${options.cursor?.joinedAt ?? null}::timestamptz IS NULL OR
+        (CASE WHEN gm.role='owner' THEN 0 ELSE 1 END, gm.joined_at, u.id) >
+          (${options.cursor?.roleOrder ?? null}::integer, ${options.cursor?.joinedAt ?? null}::timestamptz, ${options.cursor?.id ?? null}::bigint))
+    ORDER BY CASE WHEN gm.role='owner' THEN 0 ELSE 1 END,gm.joined_at,u.id
+    LIMIT ${pageSize}`;
+  const hasMore = rows.length > options.limit;
+  const page = rows.slice(0, options.limit);
+  const oldest = page.at(-1);
   return {
     ...summary,
-    members: rows.map((row) => ({
+    members: page.map(({ roleOrder: _roleOrder, ...row }) => ({
       ...row,
       joinedAt: toIsoString(row.joinedAt),
     })),
+    memberPage: {
+      hasMore,
+      nextCursor:
+        hasMore && oldest
+          ? encodeMemberCursor({
+              roleOrder: oldest.roleOrder,
+              joinedAt: toIsoString(oldest.joinedAt),
+              id: oldest.id,
+            })
+          : null,
+    },
   };
 };
 

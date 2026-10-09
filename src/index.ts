@@ -26,6 +26,7 @@ import {
   findUserByEmail,
   findUserBySession,
   getFriends,
+  getFriendsPage,
   getUnreadCounts,
   getFriendshipStatus,
   getPrivateMessages,
@@ -55,7 +56,7 @@ import {
   getGroups,
   getGroupInfo,
   getGroupMessages,
-  getGroupMemberIds,
+  iterateGroupMemberIds,
   createGroupMessage,
   createGroupAttachmentMessage,
   mutateGroupMessage,
@@ -77,6 +78,13 @@ import {
   type NewAttachment,
   type ProfilePrivacy,
 } from "./database";
+import {
+  InvalidListPaginationError,
+  parseDateIdCursor,
+  parseFriendCursor,
+  parseListPageLimit,
+  parseMemberCursor,
+} from "./list-pagination";
 import {
   ChatStatusTracker,
   type StatusClientEvent,
@@ -1040,7 +1048,7 @@ const broadcastToGroup = async (
   message: ServerMessage,
   excludeUserId?: string,
 ) => {
-  for (const userId of await getGroupMemberIds(groupId))
+  for await (const userId of iterateGroupMemberIds(groupId))
     if (userId !== excludeUserId) sendToUser(userId, message);
 };
 
@@ -1125,7 +1133,7 @@ const saveAttachmentMessage = async (
   );
   if (!message) return null;
   await broadcastToGroup(targetId, { type: "group.message.new", message });
-  for (const memberId of await getGroupMemberIds(targetId))
+  for await (const memberId of iterateGroupMemberIds(targetId))
     sendToUser(memberId, { type: "group.updated", groupId: targetId });
   return { scope, message } as const;
 };
@@ -1707,9 +1715,18 @@ app.delete("/api/profile/avatar", requireAuth, async (context) => {
 
 app.get("/api/users", requireAuth, async (context) => {
   try {
-    const users = await getFriends(context.get("user").id);
-    return context.json({ users });
+    const page = await getFriendsPage(context.get("user").id, {
+      limit: parseListPageLimit(context.req.query("limit")),
+      cursor: parseFriendCursor(context.req.query("cursor")),
+    });
+    return context.json({
+      users: page.items,
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor,
+    });
   } catch (error) {
+    if (error instanceof InvalidListPaginationError)
+      return context.json({ error: error.message }, 400);
     console.error("Failed to load friends", error);
     return context.json({ error: "Friends could not be loaded." }, 500);
   }
@@ -1718,17 +1735,20 @@ app.get("/api/users", requireAuth, async (context) => {
 app.get("/api/friends", requireAuth, async (context) => {
   try {
     const userId = context.get("user").id;
-    const [friends, counts] = await Promise.all([
-      getFriends(userId),
+    const [page, counts] = await Promise.all([
+      getFriendsPage(userId, {
+        limit: parseListPageLimit(context.req.query("limit")),
+        cursor: parseFriendCursor(context.req.query("cursor")),
+      }),
       getUnreadCounts(userId),
     ]);
     const preferences = await getPresencePreferences(
-      friends.map((friend) => friend.id),
+      page.items.map((friend) => friend.id),
     );
     const unread = new Map(
       counts.map((count) => [count.friendId, count.unreadCount]),
     );
-    const visibleFriends = friends.map((friend) => {
+    const visibleFriends = page.items.map((friend) => {
       const settings = preferences.get(friend.id)!;
       const online =
         (connectionsByUser.get(friend.id)?.size ?? 0) > 0 &&
@@ -1748,8 +1768,12 @@ app.get("/api/friends", requireAuth, async (context) => {
     });
     return context.json({
       friends: visibleFriends,
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor,
     });
   } catch (error) {
+    if (error instanceof InvalidListPaginationError)
+      return context.json({ error: error.message }, 400);
     console.error("Failed to load friends", error);
     return context.json({ error: "Friends could not be loaded." }, 500);
   }
@@ -1794,10 +1818,18 @@ app.get("/api/friends/search", requireAuth, async (context) => {
 
 app.get("/api/friend-requests", requireAuth, async (context) => {
   try {
+    const page = await getReceivedFriendRequests(context.get("user").id, {
+      limit: parseListPageLimit(context.req.query("limit")),
+      cursor: parseDateIdCursor("received", context.req.query("cursor")),
+    });
     return context.json({
-      requests: await getReceivedFriendRequests(context.get("user").id),
+      requests: page.items,
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor,
     });
   } catch (error) {
+    if (error instanceof InvalidListPaginationError)
+      return context.json({ error: error.message }, 400);
     console.error("Failed to load friend requests", error);
     return context.json({ error: "Friend requests could not be loaded." }, 500);
   }
@@ -1805,10 +1837,18 @@ app.get("/api/friend-requests", requireAuth, async (context) => {
 
 app.get("/api/friend-requests/sent", requireAuth, async (context) => {
   try {
+    const page = await getSentFriendRequests(context.get("user").id, {
+      limit: parseListPageLimit(context.req.query("limit")),
+      cursor: parseDateIdCursor("sent", context.req.query("cursor")),
+    });
     return context.json({
-      requests: await getSentFriendRequests(context.get("user").id),
+      requests: page.items,
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor,
     });
   } catch (error) {
+    if (error instanceof InvalidListPaginationError)
+      return context.json({ error: error.message }, 400);
     console.error("Failed to load sent friend requests", error);
     return context.json({ error: "Sent requests could not be loaded." }, 500);
   }
@@ -1957,8 +1997,18 @@ app.delete("/api/friend-requests/:requestId", requireAuth, async (context) => {
 
 app.get("/api/groups", requireAuth, async (context) => {
   try {
-    return context.json({ groups: await getGroups(context.get("user").id) });
+    const page = await getGroups(context.get("user").id, {
+      limit: parseListPageLimit(context.req.query("limit")),
+      cursor: parseDateIdCursor("groups", context.req.query("cursor")),
+    });
+    return context.json({
+      groups: page.items,
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor,
+    });
   } catch (error) {
+    if (error instanceof InvalidListPaginationError)
+      return context.json({ error: error.message }, 400);
     console.error("Failed to load groups", error);
     return context.json({ error: "Groups could not be loaded." }, 500);
   }
@@ -1995,7 +2045,7 @@ app.post("/api/groups", requireAuth, async (context) => {
         { error: "Groups may contain accepted friends only." },
         403,
       );
-    for (const id of group.members.map((member) => member.id))
+    for await (const id of iterateGroupMemberIds(group.id))
       sendToUser(id, { type: "group.updated", groupId: group.id });
     return context.json({ group }, 201);
   } catch (error) {
@@ -2008,10 +2058,23 @@ app.get("/api/groups/:groupId", requireAuth, async (context) => {
   const id = context.req.param("groupId") ?? "";
   if (!/^[1-9]\d{0,18}$/.test(id))
     return context.json({ error: "Group not found." }, 404);
-  const group = await getGroupInfo(id, context.get("user").id);
-  return group
-    ? context.json({ group })
-    : context.json({ error: "Group not found." }, 404);
+  try {
+    const group = await getGroupInfo(id, context.get("user").id, {
+      limit: parseListPageLimit(context.req.query("memberLimit")),
+      cursor: parseMemberCursor(context.req.query("memberCursor")),
+    });
+    return group
+      ? context.json({ group })
+      : context.json({ error: "Group not found." }, 404);
+  } catch (error) {
+    if (error instanceof InvalidListPaginationError)
+      return context.json({ error: error.message }, 400);
+    console.error("Failed to load group information", error);
+    return context.json(
+      { error: "Group information could not be loaded." },
+      500,
+    );
+  }
 });
 
 app.get("/api/groups/:groupId/messages", requireAuth, async (context) => {
@@ -2042,8 +2105,8 @@ app.put("/api/groups/:groupId", requireAuth, async (context) => {
   if (!/^[1-9]\d{0,18}$/.test(groupId))
     return context.json({ error: "Group not found." }, 404);
   try {
-    const before = await getGroupMemberIds(groupId);
     let ok = false;
+    let removedMemberId: string | null = null;
     if (action === "rename") {
       const name = typeof value?.name === "string" ? value.name.trim() : "";
       if (!name || name.length > 80)
@@ -2060,13 +2123,17 @@ app.put("/api/groups/:groupId", requireAuth, async (context) => {
         action === "add"
           ? await addGroupMember(groupId, userId, target)
           : await removeGroupMember(groupId, userId, target);
-    } else if (action === "leave") ok = await leaveGroup(groupId, userId);
-    else return context.json({ error: "Invalid group action." }, 400);
+      if (action === "remove" && ok) removedMemberId = target;
+    } else if (action === "leave") {
+      ok = await leaveGroup(groupId, userId);
+      if (ok) removedMemberId = userId;
+    } else return context.json({ error: "Invalid group action." }, 400);
     if (!ok)
       return context.json({ error: "Group action is not allowed." }, 403);
-    const after = await getGroupMemberIds(groupId);
-    for (const id of new Set([...before, ...after]))
+    for await (const id of iterateGroupMemberIds(groupId))
       sendToUser(id, { type: "group.updated", groupId });
+    if (removedMemberId)
+      sendToUser(removedMemberId, { type: "group.updated", groupId });
     return context.json({ message: "Group updated." });
   } catch (error) {
     console.error("Failed to update group", error);
@@ -2489,7 +2556,7 @@ app.get(
                     : "group.message.deleted",
                 message: updated,
               });
-              for (const id of await getGroupMemberIds(updated.groupId))
+              for await (const id of iterateGroupMemberIds(updated.groupId))
                 sendToUser(id, {
                   type: "group.updated",
                   groupId: updated.groupId,
@@ -2518,7 +2585,7 @@ app.get(
                 type: "group.message.new",
                 message: stored,
               });
-              for (const id of await getGroupMemberIds(message.groupId))
+              for await (const id of iterateGroupMemberIds(message.groupId))
                 sendToUser(id, {
                   type: "group.updated",
                   groupId: message.groupId,
