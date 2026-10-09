@@ -482,13 +482,17 @@ export const getFriends = async (
           AND message_status = 'sent' AND deleted_at IS NULL
       ) activity
       GROUP BY activity.friend_id
-    ), shared_group_activity AS (
-      SELECT theirs.user_id AS friend_id, max(message.created_at) AS recent_at
+    ), my_group_activity AS (
+      SELECT mine.group_id, max(message.created_at) AS recent_at
       FROM group_members mine
       JOIN group_messages message ON message.group_id = mine.group_id
-      JOIN group_members theirs ON theirs.group_id = mine.group_id
-        AND theirs.user_id <> ${currentUserId}
       WHERE mine.user_id = ${currentUserId}
+      GROUP BY mine.group_id
+    ), shared_group_activity AS (
+      SELECT theirs.user_id AS friend_id, max(activity.recent_at) AS recent_at
+      FROM my_group_activity activity
+      JOIN group_members theirs ON theirs.group_id = activity.group_id
+        AND theirs.user_id <> ${currentUserId}
       GROUP BY theirs.user_id
     )
     SELECT users.id::text AS id, users.username,
@@ -547,13 +551,17 @@ export const getFriendsPage = async (
       ) activity
       JOIN friend_page friend ON friend.id = activity.friend_id
       GROUP BY activity.friend_id
-    ), shared_group_activity AS (
-      SELECT theirs.user_id AS friend_id, max(message.created_at) AS recent_at
+    ), my_group_activity AS (
+      SELECT mine.group_id, max(message.created_at) AS recent_at
       FROM group_members mine
       JOIN group_messages message ON message.group_id = mine.group_id
-      JOIN group_members theirs ON theirs.group_id = mine.group_id
-      JOIN friend_page friend ON friend.id = theirs.user_id
       WHERE mine.user_id = ${currentUserId}
+      GROUP BY mine.group_id
+    ), shared_group_activity AS (
+      SELECT theirs.user_id AS friend_id, max(activity.recent_at) AS recent_at
+      FROM my_group_activity activity
+      JOIN group_members theirs ON theirs.group_id = activity.group_id
+      JOIN friend_page friend ON friend.id = theirs.user_id
       GROUP BY theirs.user_id
     )
     SELECT friend.id::text AS id, friend.username,
