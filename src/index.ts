@@ -18,6 +18,7 @@ import {
   releaseGhost,
   publishPendingGhosts,
   createSession,
+  cleanupExpiredSessionsBatch,
   createUserWithSession,
   completeOnboarding,
   deleteSession,
@@ -91,6 +92,14 @@ import {
   type StatusServerEvent,
 } from "./chat-status";
 import { startGhostScheduler } from "./ghost-scheduler";
+import {
+  readSessionCleanupSettings,
+  startSessionCleanup,
+} from "./session-cleanup";
+import {
+  getDatabaseTimeoutKind,
+  logOperationalError,
+} from "./database-runtime";
 import {
   attachmentFile,
   MAX_FILE_BYTES,
@@ -1144,7 +1153,18 @@ app.onError((error, context) => {
       { error: "Request body is too large.", code: "PAYLOAD_TOO_LARGE" },
       413,
     );
-  console.error("Unhandled backend request error", error);
+  const databaseTimeout = getDatabaseTimeoutKind(error);
+  if (databaseTimeout) {
+    logOperationalError("Backend database operation timed out", error);
+    return context.json(
+      {
+        error: "The database operation timed out. Please try again.",
+        code: "DATABASE_TIMEOUT",
+      },
+      503,
+    );
+  }
+  logOperationalError("Unhandled backend request error", error);
   return context.json(
     { error: "The request could not be completed.", code: "INTERNAL_ERROR" },
     500,
@@ -1259,7 +1279,7 @@ app.post("/api/auth/register", async (context) => {
       201,
     );
   } catch (error) {
-    console.error("Failed to register user", error);
+    logOperationalError("Failed to register user", error);
     const racedConflict = await findConflictingUser(
       profile.username,
       profile.email,
@@ -1335,7 +1355,7 @@ app.post("/api/onboarding/complete", requireAuth, async (context) => {
       message: "Onboarding completed successfully.",
     });
   } catch (error) {
-    console.error("Failed to complete onboarding", error);
+    logOperationalError("Failed to complete onboarding", error);
     return context.json(
       { error: "Onboarding could not be completed. Please try again." },
       500,
@@ -1356,7 +1376,7 @@ app.get("/api/settings", requireAuth, async (context) => {
       settings: await getUserSettings(context.get("user").id),
     });
   } catch (error) {
-    console.error("Failed to load settings", error);
+    logOperationalError("Failed to load settings", error);
     return context.json({ error: "Settings could not be loaded." }, 500);
   }
 });
@@ -1446,7 +1466,7 @@ app.put("/api/settings", requireAuth, async (context) => {
     sendToUser(userId, { type: "settings.updated", settings });
     return context.json({ settings, message: "Settings updated." });
   } catch (error) {
-    console.error("Failed to update settings", error);
+    logOperationalError("Failed to update settings", error);
     return context.json({ error: "Settings could not be updated." }, 500);
   }
 });
@@ -1622,7 +1642,7 @@ app.put("/api/profile", requireAuth, async (context) => {
       message: "Profile updated successfully.",
     });
   } catch (error) {
-    console.error("Failed to update profile", error);
+    logOperationalError("Failed to update profile", error);
     const racedConflict = await findConflictingUser(
       profile.username,
       profile.email,
@@ -1688,7 +1708,7 @@ app.post("/api/profile/avatar", requireAuth, async (context) => {
     });
   } catch (error) {
     if (uploadedPath) await removeStoredAvatar(uploadedPath);
-    console.error("Failed to update avatar", error);
+    logOperationalError("Failed to update avatar", error);
     return context.json(
       { error: "Profile picture could not be updated." },
       500,
@@ -1705,7 +1725,7 @@ app.delete("/api/profile/avatar", requireAuth, async (context) => {
       message: "Profile picture removed.",
     });
   } catch (error) {
-    console.error("Failed to remove avatar", error);
+    logOperationalError("Failed to remove avatar", error);
     return context.json(
       { error: "Profile picture could not be removed." },
       500,
@@ -1727,7 +1747,7 @@ app.get("/api/users", requireAuth, async (context) => {
   } catch (error) {
     if (error instanceof InvalidListPaginationError)
       return context.json({ error: error.message }, 400);
-    console.error("Failed to load friends", error);
+    logOperationalError("Failed to load friends", error);
     return context.json({ error: "Friends could not be loaded." }, 500);
   }
 });
@@ -1774,7 +1794,7 @@ app.get("/api/friends", requireAuth, async (context) => {
   } catch (error) {
     if (error instanceof InvalidListPaginationError)
       return context.json({ error: error.message }, 400);
-    console.error("Failed to load friends", error);
+    logOperationalError("Failed to load friends", error);
     return context.json({ error: "Friends could not be loaded." }, 500);
   }
 });
@@ -1811,7 +1831,7 @@ app.get("/api/friends/search", requireAuth, async (context) => {
       users: await searchUsers(context.get("user").id, query),
     });
   } catch (error) {
-    console.error("Failed to search users", error);
+    logOperationalError("Failed to search users", error);
     return context.json({ error: "User search could not be completed." }, 500);
   }
 });
@@ -1830,7 +1850,7 @@ app.get("/api/friend-requests", requireAuth, async (context) => {
   } catch (error) {
     if (error instanceof InvalidListPaginationError)
       return context.json({ error: error.message }, 400);
-    console.error("Failed to load friend requests", error);
+    logOperationalError("Failed to load friend requests", error);
     return context.json({ error: "Friend requests could not be loaded." }, 500);
   }
 });
@@ -1849,7 +1869,7 @@ app.get("/api/friend-requests/sent", requireAuth, async (context) => {
   } catch (error) {
     if (error instanceof InvalidListPaginationError)
       return context.json({ error: error.message }, 400);
-    console.error("Failed to load sent friend requests", error);
+    logOperationalError("Failed to load sent friend requests", error);
     return context.json({ error: "Sent requests could not be loaded." }, 500);
   }
 });
@@ -1860,7 +1880,7 @@ app.get("/api/friends/suggestions", requireAuth, async (context) => {
       users: await getFriendSuggestions(context.get("user").id),
     });
   } catch (error) {
-    console.error("Failed to load friend suggestions", error);
+    logOperationalError("Failed to load friend suggestions", error);
     return context.json(
       { error: "Friend suggestions could not be loaded." },
       500,
@@ -1905,7 +1925,7 @@ app.post("/api/friend-requests", requireAuth, async (context) => {
       201,
     );
   } catch (error) {
-    console.error("Failed to create friend request", error);
+    logOperationalError("Failed to create friend request", error);
     const status = await getFriendshipStatus(sender.id, receiverId).catch(
       () => null,
     );
@@ -1962,7 +1982,7 @@ app.put("/api/friend-requests/:requestId", requireAuth, async (context) => {
           : "Friend request rejected.",
     });
   } catch (error) {
-    console.error("Failed to respond to friend request", error);
+    logOperationalError("Failed to respond to friend request", error);
     return context.json({ error: "Friend request could not be updated." }, 500);
   }
 });
@@ -1987,7 +2007,7 @@ app.delete("/api/friend-requests/:requestId", requireAuth, async (context) => {
       ? context.json({ message: "Friend request cancelled." })
       : context.json({ error: "Pending sent request was not found." }, 404);
   } catch (error) {
-    console.error("Failed to cancel friend request", error);
+    logOperationalError("Failed to cancel friend request", error);
     return context.json(
       { error: "Friend request could not be cancelled." },
       500,
@@ -2009,7 +2029,7 @@ app.get("/api/groups", requireAuth, async (context) => {
   } catch (error) {
     if (error instanceof InvalidListPaginationError)
       return context.json({ error: error.message }, 400);
-    console.error("Failed to load groups", error);
+    logOperationalError("Failed to load groups", error);
     return context.json({ error: "Groups could not be loaded." }, 500);
   }
 });
@@ -2049,7 +2069,7 @@ app.post("/api/groups", requireAuth, async (context) => {
       sendToUser(id, { type: "group.updated", groupId: group.id });
     return context.json({ group }, 201);
   } catch (error) {
-    console.error("Failed to create group", error);
+    logOperationalError("Failed to create group", error);
     return context.json({ error: "Group could not be created." }, 500);
   }
 });
@@ -2069,7 +2089,7 @@ app.get("/api/groups/:groupId", requireAuth, async (context) => {
   } catch (error) {
     if (error instanceof InvalidListPaginationError)
       return context.json({ error: error.message }, 400);
-    console.error("Failed to load group information", error);
+    logOperationalError("Failed to load group information", error);
     return context.json(
       { error: "Group information could not be loaded." },
       500,
@@ -2092,7 +2112,7 @@ app.get("/api/groups/:groupId/messages", requireAuth, async (context) => {
   } catch (error) {
     if (error instanceof InvalidHistoryPaginationError)
       return context.json({ error: error.message }, 400);
-    console.error("Failed to load group message history", error);
+    logOperationalError("Failed to load group message history", error);
     return context.json({ error: "Group history could not be loaded." }, 500);
   }
 });
@@ -2136,7 +2156,7 @@ app.put("/api/groups/:groupId", requireAuth, async (context) => {
       sendToUser(removedMemberId, { type: "group.updated", groupId });
     return context.json({ message: "Group updated." });
   } catch (error) {
-    console.error("Failed to update group", error);
+    logOperationalError("Failed to update group", error);
     return context.json({ error: "Group could not be updated." }, 500);
   }
 });
@@ -2183,7 +2203,7 @@ app.get("/api/messages/:userId", requireAuth, async (context) => {
   } catch (error) {
     if (error instanceof InvalidHistoryPaginationError)
       return context.json({ error: error.message }, 400);
-    console.error("Failed to load private message history", error);
+    logOperationalError("Failed to load private message history", error);
     return context.json({ error: "Message history could not be loaded." }, 500);
   }
 });
@@ -2197,7 +2217,7 @@ app.get("/api/messages", requireAuth, async (context) => {
   try {
     return context.json({ messages: await getRecentMessages() });
   } catch (error) {
-    console.error("Failed to load message history", error);
+    logOperationalError("Failed to load message history", error);
     return context.json({ error: "Failed to load message history" }, 500);
   }
 });
@@ -2267,7 +2287,7 @@ app.post("/api/attachments", requireAuth, async (context) => {
     return context.json(result, 201);
   } catch (error) {
     if (storageKey) await removeAttachment(storageKey);
-    console.error("Failed to upload chat attachment", error);
+    logOperationalError("Failed to upload chat attachment", error);
     return context.json({ error: "Attachment could not be sent." }, 500);
   }
 });
@@ -2321,7 +2341,7 @@ app.post("/api/attachments/location", requireAuth, async (context) => {
           403,
         );
   } catch (error) {
-    console.error("Failed to share location", error);
+    logOperationalError("Failed to share location", error);
     return context.json({ error: "Location could not be sent." }, 500);
   }
 });
@@ -2443,7 +2463,10 @@ app.get(
               try {
                 await handleCallMessage(message, sender, client);
               } catch (error) {
-                console.error("Failed to handle voice call signal", error);
+                logOperationalError(
+                  "Failed to handle voice call signal",
+                  error,
+                );
                 sendJson(client, {
                   type: "error",
                   data: {
@@ -2462,7 +2485,7 @@ app.get(
               try {
                 await chatStatus.handle(message, sender, client);
               } catch (error) {
-                console.error("Failed to update chat status", error);
+                logOperationalError("Failed to update chat status", error);
                 sendJson(client, {
                   type: "error",
                   data: {
@@ -2610,7 +2633,10 @@ app.get(
                 );
                 sendToAllUsers({ type: "message.new", data: storedMessage });
               } catch (error) {
-                console.error("Failed to save legacy global message", error);
+                logOperationalError(
+                  "Failed to save legacy global message",
+                  error,
+                );
                 sendJson(client, {
                   type: "error",
                   data: {
@@ -2739,7 +2765,7 @@ app.get(
                 if (message.type === "message.delete")
                   await chatStatus.publishUnread(updated.receiverId);
               } catch (error) {
-                console.error("Failed to update private message", error);
+                logOperationalError("Failed to update private message", error);
                 sendJson(client, {
                   type: "error",
                   data: {
@@ -2834,10 +2860,10 @@ app.get(
               await chatStatus
                 .publishUnread(receiver.id)
                 .catch((error) =>
-                  console.error("Failed to publish unread counts", error),
+                  logOperationalError("Failed to publish unread counts", error),
                 );
             } catch (error) {
-              console.error("Failed to save private message", error);
+              logOperationalError("Failed to save private message", error);
               sendJson(client, {
                 type: "error",
                 data: {
@@ -2847,7 +2873,7 @@ app.get(
             }
           })
           .catch((error) => {
-            console.error("Failed to process WebSocket event", error);
+            logOperationalError("Failed to process WebSocket event", error);
             sendJson(client, {
               type: "error",
               data: {
@@ -2927,6 +2953,11 @@ if (serverRuntime.pbMessengerServer) {
 }
 export const server = serverRuntime.pbMessengerServer;
 startGhostScheduler(publishReleasedGhost);
+const sessionCleanupSettings = readSessionCleanupSettings();
+startSessionCleanup(
+  () => cleanupExpiredSessionsBatch(sessionCleanupSettings.batchSize),
+  sessionCleanupSettings,
+);
 const backendProtocol = devHttpsEnabled ? "https" : "http";
 console.info(
   `Realtime chat backend listening on ${backendProtocol}://localhost:${port}`,

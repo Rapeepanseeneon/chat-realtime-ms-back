@@ -1,4 +1,5 @@
 import { releaseDueGhosts, publishPendingGhosts } from "./database";
+import { logOperationalError } from "./database-runtime";
 
 // Durable schedules live in PostgreSQL. Poll overdue rows on startup too, so
 // downtime delays delivery but does not lose the schedule. No browser timers.
@@ -17,12 +18,15 @@ export const startGhostScheduler = (
       try {
         await releaseDueGhosts();
       } catch (error) {
-        console.error("Failed to release scheduled ghosts; will retry", error);
+        logOperationalError(
+          "Failed to release scheduled ghosts; will retry",
+          error,
+        );
       }
       // Previously committed releases must retry even when a new release fails.
       await publishPendingGhosts(publish);
     } catch (error) {
-      console.error("Failed to release scheduled ghosts", error);
+      logOperationalError("Failed to release scheduled ghosts", error);
     } finally {
       running = false;
     }

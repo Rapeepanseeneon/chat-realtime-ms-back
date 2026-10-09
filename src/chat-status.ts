@@ -1,4 +1,5 @@
 import type { WSContext } from "hono/ws";
+import { logOperationalError } from "./database-runtime";
 import {
   areFriends,
   getFriends,
@@ -119,11 +120,11 @@ export class ChatStatusTracker {
         (this.presenceRevisions.get(user.id) ?? 0) + 1,
       );
       void this.publishPresence(user.id).catch((error) =>
-        console.error("Failed to publish presence", error),
+        logOperationalError("Failed to publish presence", error),
       );
     }
     void this.sync(user.id, client).catch((error) =>
-      console.error("Failed to synchronize chat status", error),
+      logOperationalError("Failed to synchronize chat status", error),
     );
   }
 
@@ -140,7 +141,7 @@ export class ChatStatusTracker {
         (this.presenceRevisions.get(userId) ?? 0) + 1,
       );
       void this.publishPresence(userId).catch((error) =>
-        console.error("Failed to publish presence", error),
+        logOperationalError("Failed to publish presence", error),
       );
     }
   }

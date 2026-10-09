@@ -1,4 +1,9 @@
 import { SQL } from "bun";
+import {
+  logOperationalError,
+  runtimeDatabaseOptions,
+} from "./database-runtime";
+import { deleteExpiredSessionsBatch } from "./session-cleanup";
 import { assertDatabaseReady } from "./migrations";
 import {
   encodePrivateHistoryCursor,
@@ -309,7 +314,10 @@ const databaseGlobal = globalThis as typeof globalThis & {
 };
 const database =
   databaseGlobal.pbMessengerDatabase ??
-  new SQL(databaseUrl, { max: databasePoolSize });
+  new SQL(databaseUrl, {
+    max: databasePoolSize,
+    ...runtimeDatabaseOptions(),
+  });
 databaseGlobal.pbMessengerDatabase = database;
 const toIsoString = (value: Date | string) =>
   value instanceof Date ? value.toISOString() : new Date(value).toISOString();
@@ -1327,6 +1335,9 @@ export const deleteSession = async (tokenHash: string) => {
   await database`DELETE FROM sessions WHERE token_hash = ${tokenHash}`;
 };
 
+export const cleanupExpiredSessionsBatch = async (batchSize: number) =>
+  deleteExpiredSessionsBatch(database, batchSize);
+
 export const completeOnboarding = async (
   userId: string,
 ): Promise<PublicUser | null> => {
@@ -1646,7 +1657,7 @@ export const publishPendingGhosts = async (
         await transaction`UPDATE messages SET ghost_publish_pending = FALSE WHERE id = ${id}`;
       });
     } catch (error) {
-      console.error(
+      logOperationalError(
         `Failed to publish released ghost ${id}; will retry`,
         error,
       );
